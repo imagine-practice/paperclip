@@ -58,6 +58,40 @@ export interface OnisallPreparationStatus {
 export const ONISALL_INTAKE_DRAFT_VERSION = 2 as const;
 export const ONISALL_INPUT_MAX_BYTES = 1024 * 1024;
 const requestKey = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+export const createOnisallPreparationBaselineSchema = z.object({ requestKey }).strict();
+export type CreateOnisallPreparationBaseline = z.infer<typeof createOnisallPreparationBaselineSchema>;
+export interface OnisallPreparationBaseline {
+  protocol: "onisall.preparation-baseline.v1";
+  id: string;
+  companyId: string;
+  intakeId: string;
+  bindingId: string;
+  bindingRevision: 1;
+  snapshotId: string;
+  inputSha256: string;
+  caseId: string;
+  caseVersion: number;
+  pipelineId: string;
+  projectId: string | null;
+  stageId: string;
+  stageKey: string;
+  bindingConfigurationHash: string;
+  workflowHash: string;
+  baselineHash: string;
+  purpose: "preparation";
+  executionAdmission: "not_granted";
+  createdAt: string;
+}
+export interface OnisallPreparationBaselineStatus {
+  protocol: "onisall.preparation-baseline-status.v1";
+  evaluatedAt: string;
+  diagnosticsOnly: true;
+  baseline: OnisallPreparationBaseline;
+  comparison: { status: "matches" | "changed";
+    changes: Array<"native_pending" | "native_blocked" | "binding_changed" | "input_changed" | "case_head_changed" | "workflow_changed"> };
+  native: OnisallNativeRevalidation["native"];
+  publication: OnisallPreparationStatus["publication"];
+}
 const contentBase64 = z.string().min(4).max(4 * Math.ceil(ONISALL_INPUT_MAX_BYTES / 3))
   .regex(/^[A-Za-z0-9+/]*={0,2}$/);
 export const createOnisallIntakeDraftSchema = z.object({

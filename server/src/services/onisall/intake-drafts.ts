@@ -3,7 +3,8 @@ import { companies, onisallInputSnapshots as snapshots, onisallIntakeDrafts as d
   onisallInputObservations as observations, type Db } from "@paperclipai/db";
 import { createOnisallIntakeDraftSchema, observeOnisallInputSchema,
   type CreateOnisallIntakeDraft, type ObserveOnisallInput, type OnisallIntakeDraft,
-  type OnisallInputSnapshot, type OnisallInputObservation } from "@paperclipai/shared";
+  type OnisallInputSnapshot, type OnisallInputObservation, createOnisallPreparationBaselineSchema,
+  type CreateOnisallPreparationBaseline } from "@paperclipai/shared";
 import { readIntakeBinding, bindingView } from "./binding-view.js";
 import type { AuthorizationActor } from "../authorization.js";
 import type { StorageService } from "../../storage/types.js";
@@ -12,6 +13,8 @@ import { persistActivity, publishActivity } from "../activity-log.js";
 import { captureInputText, InputSnapshotError, MAX_INPUT_BYTES, sha256 } from "./input-snapshot.js";
 import { preparationStatus } from "./preparation-status.js";
 import { revalidateNativeBindingInTransaction } from "./native-revalidation.js";
+import { createPreparationBaselineInTransaction, preparationBaselineStatusInTransaction } from "./preparation-baselines.js";
+import { accessService } from "../access.js";
 import type { OnisallNativeRevalidation } from "@paperclipai/shared";
 
 type Snapshot = typeof snapshots.$inferSelect;
@@ -51,6 +54,10 @@ function decode(content: string) {
 // Routes authenticate board/company membership. No Agent grants or native work
 // are created here. All database writes, including audit, share one transaction.
 export function onisallIntakeDraftService(db: Db, storage: StorageService, actor?: AuthorizationActor) {
+  function directBoard() {
+    if (!actor || actor.type !== "board" || !actor.userId || actor.source === "mcp_oauth") throw forbidden("Direct board session required");
+    return actor as AuthorizationActor & { type: "board"; userId: string };
+  }
   async function activeCompany(conn: Db | Tx, companyId: string, lock = false) {
     const query = conn.select().from(companies).where(eq(companies.id, companyId));
     const [company] = await (lock ? query.for("share") : query);
@@ -89,6 +96,13 @@ export function onisallIntakeDraftService(db: Db, storage: StorageService, actor
   async function audit(tx: Tx, companyId: string, actorId: string, action: string, entityId: string, snapshotId: string) {
     return (await persistActivity(tx as unknown as Db, { companyId, actorType: "user", actorId,
       action, entityType: "onisall_intake_draft", entityId, details: { snapshotId, draftOnly: true } })).publication;
+  }
+  async function verifiedPreparation(tx: Tx, companyId: string, id: string) {
+    const row = await findDraft(tx, companyId, id);
+    await activeCompany(tx, companyId);
+    const snapshot = await findSnapshot(tx, companyId, row.initialSnapshotId);
+    const draft = await draftView(tx, row, snapshot, actor);
+    return preparationStatus(draft, await readVerified(snapshot), new Date());
   }
   return {
     async create(companyId: string, actorId: string, input: CreateOnisallIntakeDraft) {
@@ -160,28 +174,46 @@ export function onisallIntakeDraftService(db: Db, storage: StorageService, actor
       // a concurrent bind. Object bytes are independently verified; this read
       // neither locks future publication nor attests native Case freshness.
       return db.transaction(async tx => {
-        const row = await findDraft(tx, companyId, id);
-        await activeCompany(tx, companyId);
-        const snapshot = await findSnapshot(tx, companyId, row.initialSnapshotId);
-        const draft = await draftView(tx, row, snapshot, actor);
-        const bytes = await readVerified(snapshot);
-        return preparationStatus(draft, bytes, new Date());
+        return verifiedPreparation(tx, companyId, id);
       }, { isolationLevel: "repeatable read", accessMode: "read only" });
     },
     async nativeRevalidation(companyId: string, id: string): Promise<OnisallNativeRevalidation> {
-      if (!actor || actor.type !== "board" || !actor.userId || actor.source === "mcp_oauth") {
-        throw forbidden("Direct board session required");
-      }
+      const board = directBoard();
       return db.transaction(async tx => {
-        const row = await findDraft(tx, companyId, id);
-        await activeCompany(tx, companyId);
-        const snapshot = await findSnapshot(tx, companyId, row.initialSnapshotId);
-        const draft = await draftView(tx, row, snapshot, actor);
-        const preparation = preparationStatus(draft, await readVerified(snapshot), new Date());
-        const native = await revalidateNativeBindingInTransaction(tx, companyId, id, actor, preparation.input);
+        const preparation = await verifiedPreparation(tx, companyId, id);
+        const native = await revalidateNativeBindingInTransaction(tx, companyId, id, board, preparation.input);
         return { protocol: "onisall.native-revalidation.v1", evaluatedAt: new Date().toISOString(), companyId, intakeId: id,
           diagnosticsOnly: true, input: preparation.input, native, publication: preparation.publication };
       }, { isolationLevel: "repeatable read", accessMode: "read only" });
+    },
+    async createPreparationBaseline(companyId: string, id: string, input: CreateOnisallPreparationBaseline) {
+      const board = directBoard();
+      const { requestKey } = createOnisallPreparationBaselineSchema.parse(input);
+      const permission = await accessService(db).decide({ actor: board, action: "pipelines:write", resource: { type: "company", companyId } });
+      if (!permission.allowed) throw forbidden("Pipeline write permission required");
+      // At most one DB-only conflict retry. Source reads may repeat, but no
+      // native work, provider calls or activity publications occur before commit.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const result = await db.transaction(async tx => createPreparationBaselineInTransaction(tx,
+            await verifiedPreparation(tx, companyId, id), board, board.userId, requestKey), { isolationLevel: "repeatable read" });
+          if (result.publication) publishActivity(result.publication);
+          return { baseline: result.baseline, replayed: result.replayed };
+        } catch (error) {
+          const cause = error instanceof Error && error.cause ? error.cause : error;
+          const code = typeof cause === "object" && cause !== null && "code" in cause ? cause.code : null;
+          const constraint = typeof cause === "object" && cause !== null && "constraint_name" in cause ? cause.constraint_name : null;
+          const retryable = code === "40001" || (code === "23505" && constraint === "onisall_preparation_baselines_request_uq");
+          if (!retryable) throw error;
+          if (attempt === 1) throw conflict("Concurrent preparation change requires a fresh request");
+        }
+      }
+      throw conflict("Preparation baseline unavailable");
+    },
+    async preparationBaselineStatus(companyId: string, id: string, baselineId: string) {
+      const board = directBoard();
+      return db.transaction(async tx => preparationBaselineStatusInTransaction(tx,
+        await verifiedPreparation(tx, companyId, id), board, baselineId), { isolationLevel: "repeatable read", accessMode: "read only" });
     },
     async observe(companyId: string, id: string, actorId: string, input: ObserveOnisallInput) {
       const data = observeOnisallInputSchema.parse(input);

@@ -81,6 +81,7 @@ export const onisallNativeBindings = pgTable("onisall_native_bindings", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   intakeUq: unique("onisall_native_bindings_intake_uq").on(t.companyId, t.intakeId),
+  baselineScopeUq: unique("onisall_native_bindings_baseline_scope_uq").on(t.companyId, t.intakeId, t.id),
   caseUq: unique("onisall_native_bindings_case_uq").on(t.caseId),
   intakeFk: foreignKey({ name: "onisall_native_bindings_intake_fk",
     columns: [t.companyId, t.intakeId, t.snapshotId],

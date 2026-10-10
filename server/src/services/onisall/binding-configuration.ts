@@ -27,10 +27,13 @@ export function bindingConfigurationHash(pipeline: Pipeline, stage: Stage): stri
   return bindingDigest(["onisall.binding-context.v1", pipelineIdentity(pipeline), stageIdentity(stage)]);
 }
 /** Current workflow observation. Existing bindings do not freeze this hash. */
-export function workflowConfigurationHash(pipeline: Pipeline, stages: Stage[], transitions: Transition[]): string {
-  return bindingDigest(["onisall.workflow-observation.v1", { ...pipelineIdentity(pipeline), key: pipeline.key,
+export function serializeWorkflowConfiguration(pipeline: Pipeline, stages: Stage[], transitions: Transition[]): string {
+  return canonical(["onisall.workflow-observation.v1", { ...pipelineIdentity(pipeline), key: pipeline.key,
     name: pipeline.name, description: pipeline.description, archivedAt: pipeline.archivedAt?.toISOString() ?? null },
     [...stages].sort((a, b) => a.id.localeCompare(b.id)).map(stage => ({ ...stageIdentity(stage), name: stage.name, position: stage.position })),
     [...transitions].sort((a, b) => a.id.localeCompare(b.id)).map(edge => ({ id: edge.id,
       fromStageId: edge.fromStageId, toStageId: edge.toStageId, label: edge.label, updatedAt: edge.updatedAt.toISOString() }))]);
+}
+export function workflowConfigurationHash(pipeline: Pipeline, stages: Stage[], transitions: Transition[]): string {
+  return sha256(Buffer.from(serializeWorkflowConfiguration(pipeline, stages, transitions), "utf8"));
 }

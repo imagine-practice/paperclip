@@ -1,7 +1,8 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { createOnisallIntakeDraftSchema, observeOnisallInputSchema, createOnisallBindingSchema, onisallBindingContextSchema } from "@paperclipai/shared";
+import { createOnisallIntakeDraftSchema, observeOnisallInputSchema, createOnisallBindingSchema, onisallBindingContextSchema,
+  createOnisallPreparationBaselineSchema } from "@paperclipai/shared";
 import type { StorageService } from "../storage/types.js";
 import { forbidden, unauthorized } from "../errors.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
@@ -45,6 +46,16 @@ export function onisallIntakeRoutes(db: Db, storage: StorageService) {
   router.get(`${base}/:id/native-revalidation`, async (req, res) => {
     z.strictObject({}).parse(req.query);
     res.json(await svc(req).nativeRevalidation(req.params.companyId as string, z.string().uuid().parse(req.params.id)));
+  });
+  router.post(`${base}/:id/preparation-baselines`, validate(createOnisallPreparationBaselineSchema), async (req, res) => {
+    z.strictObject({}).parse(req.query);
+    const result = await svc(req).createPreparationBaseline(req.params.companyId as string, z.string().uuid().parse(req.params.id), req.body);
+    res.status(result.replayed ? 200 : 201).json(result);
+  });
+  router.get(`${base}/:id/preparation-baselines/:baselineId`, async (req, res) => {
+    z.strictObject({}).parse(req.query);
+    res.json(await svc(req).preparationBaselineStatus(req.params.companyId as string,
+      z.string().uuid().parse(req.params.id), z.string().uuid().parse(req.params.baselineId)));
   });
   router.post(`${base}/:id/observations`, validate(observeOnisallInputSchema), async (req, res) => {
     const result = await svc(req).observe(req.params.companyId as string, z.string().uuid().parse(req.params.id), req.actor.userId!, req.body);

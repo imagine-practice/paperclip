@@ -4,7 +4,8 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createDb, companies, projects, projectAccessMembers, pipelines, pipelineStages, pipelineCases, pipelineCaseEvents,
   pipelineAutomationExecutions, documents, activityLog, issues, routines, routineRuns, heartbeatRuns,
-  pipelineTransitions, onisallIntakeDrafts, onisallInputObservations, onisallInputSnapshots, onisallNativeBindings } from "@paperclipai/db";
+  pipelineTransitions, onisallIntakeDrafts, onisallInputObservations, onisallInputSnapshots, onisallNativeBindings,
+  onisallPreparationBaselines } from "@paperclipai/db";
 import type { CreateOnisallBinding, OnisallBindingContext } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { onisallNativeBindingService } from "../services/onisall/native-bindings.js";
@@ -47,6 +48,7 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
   afterEach(async () => {
     beforeRead = undefined;
     // Dedicated test database only, never the development instance.
+    await db.delete(onisallPreparationBaselines);
     await db.delete(onisallNativeBindings);
     await db.delete(onisallInputObservations);
     await db.delete(onisallIntakeDrafts);
@@ -81,6 +83,167 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
     const context = await service.context(company!.id, draft.id, { pipelineId: pipeline.id, entryStageKey: "intake" });
     return { company: company!, project, pipeline, draft, service, native, intakeSvc, input, request: request(context) };
   }
+  async function freeze() {
+    const f = await setup(true);
+    const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    const { baseline } = await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "baseline" });
+    return { ...f, binding, baseline };
+  }
+  it("persists complete workflow bytes and audit, without changing native authority", async () => {
+    const f = await freeze();
+    const [row] = await db.select().from(onisallPreparationBaselines);
+    expect(createHash("sha256").update(row!.workflowSnapshot).digest("hex")).toBe(f.baseline.workflowHash);
+    const snapshot = JSON.parse(row!.workflowSnapshot) as unknown[];
+    expect(snapshot[0]).toBe("onisall.workflow-observation.v1");
+    expect((snapshot[2] as unknown[]).length).toBe((await db.select().from(pipelineStages)).length);
+    expect((snapshot[3] as unknown[]).length).toBe((await db.select().from(pipelineTransitions)).length);
+    expect(f.baseline).toMatchObject({ caseVersion: 1, stageKey: "intake", purpose: "preparation", executionAdmission: "not_granted" });
+    const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, f.baseline.id));
+    expect(logs).toHaveLength(1); expect(logs[0]!.action).toBe("onisall.preparation_baseline.created");
+    const tables = [pipelineCases, pipelineCaseEvents, onisallNativeBindings, onisallInputObservations,
+      pipelineAutomationExecutions, issues, heartbeatRuns, activityLog, onisallPreparationBaselines];
+    const before = await Promise.all(tables.map(table => db.select().from(table)));
+    const status = await f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, f.baseline.id);
+    expect(status).toMatchObject({ diagnosticsOnly: true, comparison: { status: "matches", changes: [] },
+      native: { status: "consistent" }, publication: { status: "unavailable", executionAdmission: "not_granted" } });
+    for (const key of ["workflowSnapshot", "requestKey", "fields", "leaseToken", "goal", "sourceLabel", "objectKey", "contentBase64", "createdByUserId"]) {
+      expect(JSON.stringify(status)).not.toContain(`"${key}"`);
+    }
+    expect(await Promise.all(tables.map(table => db.select().from(table)))).toEqual(before);
+    expect((await f.intakeSvc.get(f.company.id, f.draft.id)).contractId).toBeNull();
+  });
+  it("serializes concurrent request keys to one observation and one audit", async () => {
+    const f = await setup();
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    const results = await Promise.all(Array.from({ length: 4 }, () => f.intakeSvc.createPreparationBaseline(
+      f.company.id, f.draft.id, { requestKey: "same-key" })));
+    expect(results.filter(r => !r.replayed)).toHaveLength(1);
+    expect(new Set(results.map(r => r.baseline.id)).size).toBe(1);
+    expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "onisall.preparation_baseline.created"))).toHaveLength(1);
+  });
+  it.each(["other_stage", "transition", "pipeline_name", "case_version"])("detects %s changes and preserves original keyed replay", async change => {
+    const f = await freeze();
+    if (change === "other_stage") await db.update(pipelineStages).set({ config: { autonomy: "manual" } })
+      .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "in_progress")));
+    if (change === "transition") await db.update(pipelineTransitions).set({ label: "Changed edge" }).where(eq(pipelineTransitions.pipelineId, f.pipeline.id));
+    if (change === "pipeline_name") await db.update(pipelines).set({ name: "Renamed" }).where(eq(pipelines.id, f.pipeline.id));
+    if (change === "case_version") await db.update(pipelineCases).set({ version: 2 }).where(eq(pipelineCases.id, f.binding.caseId));
+    const result = await f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, f.baseline.id);
+    expect(result.comparison).toEqual({ status: "changed", changes: [change === "case_version" ? "case_head_changed" : "workflow_changed"] });
+    expect(result.native.status).toBe("consistent");
+    expect(await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "baseline" }))
+      .toEqual({ baseline: f.baseline, replayed: true });
+    const next = await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "new-observation" });
+    expect(next.baseline.id).not.toBe(f.baseline.id); expect(next.baseline.baselineHash).not.toBe(f.baseline.baselineHash);
+    expect((await f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, next.baseline.id)).comparison.status).toBe("matches");
+  });
+  it.each(["archive", "retire", "move", "disable", "project_pause"])("reports unavailable %s and refuses a new baseline", async change => {
+    const f = await freeze();
+    if (change === "archive") await db.update(pipelines).set({ archivedAt: new Date() }).where(eq(pipelines.id, f.pipeline.id));
+    if (change === "retire") await db.update(pipelineCases).set({ retiredAt: new Date() }).where(eq(pipelineCases.id, f.binding.caseId));
+    if (change === "move") await f.native.transitionCase({ companyId: f.company.id, caseId: f.binding.caseId,
+      toStageKey: "in_progress", expectedVersion: 1, actor: { type: "user", userId: "owner" } });
+    if (change === "disable") await db.update(pipelineStages).set({ config: { disabled: true } })
+      .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "intake")));
+    if (change === "project_pause") await db.update(projects).set({ pausedAt: new Date() }).where(eq(projects.id, f.project!.id));
+    const result = await f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, f.baseline.id);
+    expect(result.comparison.status).toBe("changed"); expect(result.comparison.changes).toContain("native_blocked");
+    expect((await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "baseline" })).baseline).toEqual(f.baseline);
+    await expect(f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "new" })).rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(1);
+  });
+  it("rejects pending, damaged source and stored baseline tampering without a silent repair", async () => {
+    const f = await setup();
+    await expect(f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "pending" })).rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(0);
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    const { baseline } = await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "good" });
+    const [snapshot] = await db.select().from(onisallInputSnapshots);
+    const original = blobs.get(snapshot!.objectKey)!; blobs.set(snapshot!.objectKey, Buffer.from("damaged"));
+    await expect(f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, baseline.id)).rejects.toMatchObject({ status: 409 });
+    await expect(f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "good" })).rejects.toMatchObject({ status: 409 });
+    blobs.set(snapshot!.objectKey, original);
+    await db.update(onisallPreparationBaselines).set({ workflowSnapshot: "{}" });
+    await expect(f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, baseline.id)).rejects.toMatchObject({ status: 409 });
+    await expect(f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "good" })).rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "onisall.preparation_baseline.created"))).toHaveLength(1);
+  });
+  it("enforces database reference scope, preparation shape and workflow size limit", async () => {
+    const f = await freeze();
+    for (const patch of [{ companyId: randomUUID() }, { snapshotId: randomUUID() }, { bindingId: randomUUID() },
+      { caseId: randomUUID() }, { projectId: randomUUID() }, { pipelineId: randomUUID() }, { caseVersion: 0 },
+      { executionAdmission: "granted" }, { requestKey: "bad key" }, { workflowSnapshot: "x".repeat(1024 * 1024 + 1) }]) {
+      await expect(db.update(onisallPreparationBaselines).set(patch)).rejects.toBeDefined();
+    }
+    await db.update(pipelineStages).set({ config: { note: "x".repeat(1024 * 1024) } })
+      .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "in_progress")));
+    await expect(f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "oversized" })).rejects.toMatchObject({ status: 422 });
+    expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(1);
+  });
+  it("hides foreign company/intake and private Project baselines and denies viewer mutation", async () => {
+    const f = await freeze();
+    await expect(f.intakeSvc.preparationBaselineStatus(randomUUID(), f.draft.id, f.baseline.id)).rejects.toMatchObject({ status: 404 });
+    await expect(f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, randomUUID())).rejects.toMatchObject({ status: 404 });
+    const other = await f.intakeSvc.create(f.company.id, "owner", { ...f.input, requestKey: "other" });
+    await expect(f.intakeSvc.preparationBaselineStatus(f.company.id, other.draft.id, f.baseline.id)).rejects.toMatchObject({ status: 404 });
+    const outsider = onisallIntakeDraftService(db, storage, { type: "board", userId: "outsider", source: "session", companyIds: [f.company.id] });
+    await expect(outsider.preparationBaselineStatus(f.company.id, f.draft.id, f.baseline.id)).rejects.toMatchObject({ status: 404 });
+    const viewer = onisallIntakeDraftService(db, storage, { type: "board", userId: "owner", source: "session", companyIds: [f.company.id],
+      memberships: [{ companyId: f.company.id, status: "active", membershipRole: "viewer" }] });
+    expect((await viewer.preparationBaselineStatus(f.company.id, f.draft.id, f.baseline.id)).comparison.status).toBe("matches");
+    await expect(viewer.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "viewer" })).rejects.toMatchObject({ status: 403 });
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.company.id));
+    await expect(f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "baseline" })).rejects.toMatchObject({ status: 409 });
+  });
+  it("rolls back a baseline when its audit cannot persist", async () => {
+    const f = await setup(); await f.service.bind(f.company.id, f.draft.id, f.request);
+    const failingDb = new Proxy(db, { get(target, key) {
+      if (key === "transaction") return (work: (tx: unknown) => Promise<unknown>, options: Parameters<typeof db.transaction>[1]) =>
+        db.transaction(async tx => work(new Proxy(tx, { get(conn, member) {
+          if (member === "insert") return (table: unknown) => {
+            if (table === activityLog) throw new Error("injected-baseline-audit-failure");
+            return conn.insert(table as typeof activityLog);
+          };
+          const value = Reflect.get(conn, member); return typeof value === "function" ? value.bind(conn) : value;
+        } })), options);
+      const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    await expect(onisallIntakeDraftService(failingDb, storage, actor).createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "audit" }))
+      .rejects.toThrow("injected-baseline-audit-failure");
+    expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(0);
+    expect((await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "audit" })).replayed).toBe(false);
+  });
+  it.each(["case", "workflow"])("handles concurrent %s changes as a conflict or a historical observation", async change => {
+    const f = await setup(); const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    let arrived!: () => void; let release!: () => void;
+    const ready = new Promise<void>(r => { arrived = r; }); const hold = new Promise<void>(r => { release = r; });
+    let reads = 0;
+    beforeRead = async () => { if (++reads === 1) { arrived(); await hold; } };
+    const inFlight = f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "concurrent" })
+      .then(result => ({ result, error: null }), error => ({ result: null, error: error as unknown }));
+    await ready;
+    try {
+      if (change === "case") await f.native.transitionCase({ companyId: f.company.id, caseId: binding.caseId,
+        toStageKey: "in_progress", expectedVersion: 1, actor: { type: "user", userId: "owner" } });
+      else await db.update(pipelineStages).set({ config: { autonomy: "manual" } })
+        .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "in_progress")));
+    } finally { release(); }
+    const settled = await inFlight;
+    beforeRead = undefined;
+    if (change === "case") {
+      // FK integrity checks can raise serialization failure after the native
+      // row changes. The bounded fresh-snapshot retry must reject moved Cases.
+      expect(reads).toBe(2); expect(settled.error).toMatchObject({ status: 409 });
+      expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(0);
+      return;
+    }
+    expect(settled.error).toBeNull();
+    const { baseline } = settled.result!;
+    expect(baseline.caseVersion).toBe(1); expect(baseline.stageKey).toBe("intake");
+    const status = await f.intakeSvc.preparationBaselineStatus(f.company.id, f.draft.id, baseline.id);
+    expect(status.comparison.changes).toContain("workflow_changed");
+  });
   it("revalidates real input and native current head with no effects or replayable authority", async () => {
     const f = await setup();
     expect((await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).native).toEqual({ status: "pending" });

@@ -10,7 +10,8 @@ import { createHttpLogger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { HttpError } from "../errors.js";
 
-const svc = vi.hoisted(() => ({ create: vi.fn(), get: vi.fn(), observe: vi.fn(), observations: vi.fn(), content: vi.fn(), preparationStatus: vi.fn(), nativeRevalidation: vi.fn() }));
+const svc = vi.hoisted(() => ({ create: vi.fn(), get: vi.fn(), observe: vi.fn(), observations: vi.fn(), content: vi.fn(), preparationStatus: vi.fn(), nativeRevalidation: vi.fn(),
+  createPreparationBaseline: vi.fn(), preparationBaselineStatus: vi.fn() }));
 const binding = vi.hoisted(() => ({ context: vi.fn(), get: vi.fn(), bind: vi.fn() }));
 vi.mock("../services/onisall/native-bindings.js", () => ({ onisallNativeBindingService: () => binding }));
 vi.mock("../services/onisall/intake-drafts.js", () => ({ onisallIntakeDraftService: () => svc }));
@@ -37,6 +38,8 @@ beforeEach(() => {
   svc.get.mockResolvedValue({ id });
   svc.preparationStatus.mockResolvedValue({ intakeId: id, diagnosticsOnly: true });
   svc.nativeRevalidation.mockResolvedValue({ intakeId: id, diagnosticsOnly: true });
+  svc.createPreparationBaseline.mockResolvedValue({ baseline: { id }, replayed: false });
+  svc.preparationBaselineStatus.mockResolvedValue({ baseline: { id }, diagnosticsOnly: true });
   binding.get.mockResolvedValue({ binding: null });
   binding.bind.mockResolvedValue({ binding: { id }, replayed: false });
   binding.context.mockResolvedValue({ intakeId: id });
@@ -69,6 +72,44 @@ describe.each(["preparation-status", "native-revalidation"])("OnisAll %s route (
     await request(appFor(board)).get(`${base}/${id}/${endpoint}`).expect(status);
   });
 });
+describe("OnisAll preparation baselines (injected actors)", () => {
+  const path = `${base}/${id}/preparation-baselines`;
+  it.each([{ type: "none" }, { type: "agent", companyId: company, agentId: id },
+    { ...board, source: "mcp_oauth" }, { ...board, companyIds: [] }])("rejects unauthorized reads and writes", async actor => {
+    const app = appFor(actor);
+    await request(app).get(`${path}/${id}`).expect(403);
+    await request(app).post(path).send({ requestKey: "freeze" }).expect(403);
+    expect(svc.createPreparationBaseline).not.toHaveBeenCalled(); expect(svc.preparationBaselineStatus).not.toHaveBeenCalled();
+  });
+  it("permits noncached viewer reads but denies mutation", async () => {
+    const app = appFor({ ...board, memberships: [{ companyId: company, status: "active", membershipRole: "viewer" }] });
+    const result = await request(app).get(`${path}/${id}`).expect(200);
+    expect(result.headers["cache-control"]).toBe("no-store");
+    expect(svc.preparationBaselineStatus).toHaveBeenCalledWith(company, id, id);
+    await request(app).post(path).send({ requestKey: "freeze" }).expect(403);
+    expect(svc.createPreparationBaseline).not.toHaveBeenCalled();
+  });
+  it("takes only a logical request key and returns original replay with HTTP 200", async () => {
+    const app = appFor(board);
+    await request(app).post(path).send({ requestKey: "freeze" }).expect(201);
+    expect(svc.createPreparationBaseline).toHaveBeenCalledWith(company, id, { requestKey: "freeze" });
+    svc.createPreparationBaseline.mockResolvedValue({ baseline: { id }, replayed: true });
+    await request(app).post(path).send({ requestKey: "freeze" }).expect(200);
+  });
+  it.each(["caseVersion", "workflowHash", "approved", "contractId"])("rejects caller-provided %s authority", async key => {
+    await request(appFor(board)).post(path).send({ requestKey: "freeze", [key]: "untrusted" }).expect(400);
+    expect(svc.createPreparationBaseline).not.toHaveBeenCalled();
+  });
+  it("rejects malformed keys, IDs and diagnostic query verdicts", async () => {
+    const app = appFor(board);
+    await request(app).post(path).send({ requestKey: "bad key" }).expect(400);
+    await request(app).post(`${path}?approved=true`).send({ requestKey: "freeze" }).expect(400);
+    await request(app).get(`${path}/bad`).expect(400);
+    await request(app).get(`${path}/${id}?approved=true`).expect(400);
+    expect(svc.createPreparationBaseline).not.toHaveBeenCalled(); expect(svc.preparationBaselineStatus).not.toHaveBeenCalled();
+  });
+});
+
 describe("OnisAll route authority (injected actor fixtures, not login proof)", () => {
   it.each([{ type: "none" }, { type: "agent", companyId: company, agentId: id },
     { ...board, source: "mcp_oauth" }, { ...board, companyIds: [] }])("rejects unauthorised actors before service access", async (actor) => {

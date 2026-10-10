@@ -38,6 +38,7 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  onisallPreparationBaselines,
   onisallNativeBindings,
   onisallInputObservations,
   onisallIntakeDrafts,
@@ -607,6 +608,7 @@ export function companyService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
         await tx.delete(documents).where(eq(documents.companyId, id));
         await tx.delete(issues).where(eq(issues.companyId, id));
+        await tx.delete(onisallPreparationBaselines).where(eq(onisallPreparationBaselines.companyId, id));
         await tx.delete(onisallNativeBindings).where(eq(onisallNativeBindings.companyId, id));
         await tx.delete(onisallInputObservations).where(eq(onisallInputObservations.companyId, id));
         await tx.delete(onisallIntakeDrafts).where(eq(onisallIntakeDrafts.companyId, id));
