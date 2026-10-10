@@ -4368,7 +4368,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       leaseMs?: number;
     }) {
       return db.transaction(async (tx) => {
-        const { case: existing } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+        // Serialize the ownership check with the lease update. Two claimers must
+        // not both observe an unleased row and return different successful tokens.
+        const { case: existing } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         const current = await expireLeaseIfNeeded(tx, existing, { type: "system" });
         if (hasValidLease(current) && !actorOwnsLease(current, input.actor, null)) {
           throw conflict("Pipeline case lease is held", { code: "lease_held", lease: leaseOwner(current) });
@@ -4407,7 +4409,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       force?: boolean;
     }) {
       return db.transaction(async (tx) => {
-        const { case: existing } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+        // Use the same lock as claim/transition so an old release cannot clear a
+        // lease acquired between its ownership check and write.
+        const { case: existing } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         const current = await expireLeaseIfNeeded(tx, existing, { type: "system" });
         if (!input.force && hasValidLease(current) && !actorOwnsLease(current, input.actor, input.leaseToken)) {
           throw conflict("Pipeline case lease is held", { code: "lease_held", lease: leaseOwner(current) });
