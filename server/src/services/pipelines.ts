@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
-import { alias } from "drizzle-orm/pg-core";
+import { and, asc, desc, eq, inArray, is, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import { alias, PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -2224,6 +2224,190 @@ async function descendantCaseIds(db: PipelineDb, companyId: string, rootCaseIds:
   return Array.from(result).map((row) => String((row as { id: string }).id));
 }
 
+export type PipelineCaseIngestInput = {
+  companyId: string;
+  pipelineId: string;
+  caseKey?: string | null;
+  title: string;
+  summary?: string | null;
+  fields?: Record<string, unknown>;
+  workspaceRef?: Record<string, unknown> | null;
+  stageKey?: string | null;
+  parentCaseId?: string | null;
+  requestKey?: string | null;
+  blockedByCaseIds?: string[];
+  blockedByCaseKeys?: string[];
+  actor: PipelineActor;
+};
+
+/**
+ * Internal composition boundary. The caller owns the outer transaction and
+ * authorization. Persist native Case/documents/events/automation intent only;
+ * never run a routine or publish execution before the outer commit succeeds.
+ * A returned ledger is pending intent, not evidence of a dispatched Run.
+ */
+export async function ingestPipelineCaseInTransaction(
+  tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+  input: PipelineCaseIngestInput,
+) {
+  if (!is(tx, PgTransaction)) {
+    throw conflict("Case ingest composition requires a transaction", { code: "transaction_required" });
+  }
+  assertJsonSize(input.fields ?? {}, "fields");
+  if (input.workspaceRef !== undefined && input.workspaceRef !== null) {
+    assertJsonSize(input.workspaceRef, "workspaceRef");
+  }
+  assertActorProvenance(input.actor);
+  const caseKey = input.caseKey ?? randomUUID();
+  assertCaseKey(caseKey);
+
+  const pipeline = await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+  if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
+  const requestKey = input.requestKey?.trim() || null;
+  const parentCase = await assertValidParentCase(tx, { companyId: input.companyId, parentCaseId: input.parentCaseId ?? null });
+  if (requestKey && !input.parentCaseId) {
+    throw unprocessable("requestKey requires parentCaseId", { code: "validation" });
+  }
+  if (requestKey && parentCase) {
+    const existingByRequestKey = await tx
+      .select()
+      .from(pipelineCases)
+      .where(and(
+        eq(pipelineCases.companyId, input.companyId),
+        eq(pipelineCases.parentCaseId, parentCase.id),
+        eq(pipelineCases.requestKey, requestKey),
+        isNull(pipelineCases.retiredAt),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existingByRequestKey) return { case: existingByRequestKey, created: false };
+  }
+  const automationAttempt = input.actor.type === "agent"
+    ? await resolveAutomationAttemptForActorRun(tx, input.companyId, input.actor.runId)
+    : null;
+  const blockedByCaseKeyMap = await resolveBlockerCaseKeys(tx, {
+    companyId: input.companyId,
+    pipelineId: input.pipelineId,
+    blockedByCaseKeys: input.blockedByCaseKeys ?? [],
+  });
+  const blockedByCaseIds = await validateBlockerSet(tx, {
+    companyId: input.companyId,
+    caseId: "__new_case__",
+    blockedByCaseIds: [
+      ...(input.blockedByCaseIds ?? []),
+      ...Array.from(blockedByCaseKeyMap.values()),
+    ],
+  });
+  const stage = input.stageKey
+    ? await getStageByKeyOrThrow(tx, input.pipelineId, input.stageKey)
+    : await tx
+      .select()
+      .from(pipelineStages)
+      .where(eq(pipelineStages.pipelineId, input.pipelineId))
+      .orderBy(asc(pipelineStages.position), asc(pipelineStages.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  if (!stage) throw unprocessable("Pipeline has no stages", { code: "validation" });
+  assertStageEnabled(stage, "ingest");
+  validateAddFormFieldsForStage(stage, input.fields ?? {});
+
+  const [inserted] = await tx
+    .insert(pipelineCases)
+    .values({
+      companyId: input.companyId,
+      pipelineId: input.pipelineId,
+      stageId: stage.id,
+      caseKey,
+      title: input.title,
+      summary: input.summary ?? null,
+      fields: input.fields ?? {},
+      workspaceRef: input.workspaceRef ?? null,
+      parentCaseId: input.parentCaseId ?? null,
+      parentCaseVersion: parentCase?.version ?? null,
+      requestKey,
+      automationAttemptId: automationAttempt?.id ?? null,
+      terminalKind: terminalKindForStage(stage.kind),
+      terminalAt: isTerminalKind(stage.kind) ? nowDate() : null,
+      createdByUserId: input.actor.type === "user" ? input.actor.userId : null,
+      createdByAgentId: input.actor.type === "agent" ? input.actor.agentId : null,
+      originRunId: input.actor.type === "agent" ? input.actor.runId : null,
+    })
+    .onConflictDoNothing()
+    .returning();
+
+  if (!inserted) {
+    const existingByRequestKey = requestKey && parentCase
+      ? await tx
+        .select()
+        .from(pipelineCases)
+        .where(and(
+          eq(pipelineCases.companyId, input.companyId),
+          eq(pipelineCases.parentCaseId, parentCase.id),
+          eq(pipelineCases.requestKey, requestKey),
+          isNull(pipelineCases.retiredAt),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    const existing = existingByRequestKey ?? await tx
+      .select()
+      .from(pipelineCases)
+      .where(and(eq(pipelineCases.pipelineId, input.pipelineId), eq(pipelineCases.caseKey, caseKey)))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!existing) throw conflict("Pipeline case ingest conflict", { code: "ingest_conflict" });
+    return { case: existing, created: false };
+  }
+
+  await ensurePipelineCaseBodyDocumentFromSummary(tx, {
+    companyId: input.companyId,
+    caseId: inserted.id,
+    summary: input.summary,
+    actor: input.actor,
+  });
+
+  const ingestEvent = await writeCaseEvent(tx, {
+    companyId: input.companyId,
+    caseId: inserted.id,
+    type: "ingested",
+    actor: input.actor,
+    toStageId: stage.id,
+    payload: { caseKey, requestKey, parentCaseVersion: inserted.parentCaseVersion },
+  });
+  await adjustParentCounts(tx, {
+    parentCaseId: inserted.parentCaseId,
+    childDelta: 1,
+    terminalChildDelta: isTerminalKind(inserted.terminalKind) ? 1 : 0,
+  });
+  if (blockedByCaseIds.length > 0) {
+    await tx.insert(pipelineCaseBlockers).values(blockedByCaseIds.map((blockedByCaseId) => ({
+      companyId: input.companyId,
+      caseId: inserted.id,
+      blockedByCaseId,
+    })));
+    await writeCaseEvent(tx, {
+      companyId: input.companyId,
+      caseId: inserted.id,
+      type: "blockers_set",
+      actor: input.actor,
+      payload: {
+        blockedByCaseIds,
+        ...(input.blockedByCaseKeys?.length ? { blockedByCaseKeys: input.blockedByCaseKeys } : {}),
+      },
+    });
+  }
+  if (blockedByCaseIds.length === 0) {
+    const ledger = await enqueueStageAutomationLedger(tx, {
+      companyId: input.companyId,
+      caseId: inserted.id,
+      stage,
+      eventId: ingestEvent.id,
+    });
+    return { case: inserted, created: true, event: ingestEvent, automationLedger: ledger };
+  }
+  return { case: inserted, created: true, event: ingestEvent, automationLedger: null };
+}
+
 export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
   const routinesSvc = routineService(db, { heartbeat: deps.heartbeat });
   const outputsSvc = pipelineCaseOutputsService(db);
@@ -3462,6 +3646,35 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     }
   }
 
+  async function commitCaseIngest<TRelated>(
+    input: PipelineCaseIngestInput,
+    persistRelated: (
+      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      ingest: Awaited<ReturnType<typeof ingestPipelineCaseInTransaction>>,
+    ) => Promise<TRelated>,
+  ) {
+    if (is(db, PgTransaction)) {
+      throw conflict("Case ingest dispatch requires the root database", { code: "root_database_required" });
+    }
+    const { result, related } = await db.transaction(async (tx) => {
+      const result = await ingestPipelineCaseInTransaction(tx, input);
+      const related = await persistRelated(tx, result);
+      return { result, related };
+    });
+    const automationLedgers = "automationLedger" in result && result.automationLedger
+      ? [result.automationLedger]
+      : [];
+    const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
+    if ("automationLedger" in result && result.automationLedger) {
+      return { ingest: {
+        ...result,
+        automationExecution: automationExecutions.get(result.automationLedger.id) ?? { status: "none" },
+        automationExecutions: [...automationExecutions.values()],
+      }, related };
+    }
+    return { ingest: { ...result, automationExecution: { status: "none" } satisfies PipelineAutomationExecutionResult }, related };
+  }
+
   const service = {
     resolveBreakdownTarget,
 
@@ -3890,187 +4103,24 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       return transition!;
     },
 
-    async ingestCase(input: {
-      companyId: string;
-      pipelineId: string;
-      caseKey?: string | null;
-      title: string;
-      summary?: string | null;
-      fields?: Record<string, unknown>;
-      workspaceRef?: Record<string, unknown> | null;
-      stageKey?: string | null;
-      parentCaseId?: string | null;
-      requestKey?: string | null;
-      blockedByCaseIds?: string[];
-      blockedByCaseKeys?: string[];
-      actor: PipelineActor;
-    }) {
-      assertJsonSize(input.fields ?? {}, "fields");
-      if (input.workspaceRef !== undefined && input.workspaceRef !== null) {
-        assertJsonSize(input.workspaceRef, "workspaceRef");
-      }
-      assertActorProvenance(input.actor);
-      const caseKey = input.caseKey ?? randomUUID();
-      assertCaseKey(caseKey);
+    async ingestCase(input: PipelineCaseIngestInput) {
+      return (await commitCaseIngest(input, async () => undefined)).ingest;
+    },
 
-      const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction(async (tx) => {
-        const pipeline = await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
-        if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
-        const requestKey = input.requestKey?.trim() || null;
-        const parentCase = await assertValidParentCase(tx, { companyId: input.companyId, parentCaseId: input.parentCaseId ?? null });
-        if (requestKey && !input.parentCaseId) {
-          throw unprocessable("requestKey requires parentCaseId", { code: "validation" });
-        }
-        if (requestKey && parentCase) {
-          const existingByRequestKey = await tx
-            .select()
-            .from(pipelineCases)
-            .where(and(
-              eq(pipelineCases.companyId, input.companyId),
-              eq(pipelineCases.parentCaseId, parentCase.id),
-              eq(pipelineCases.requestKey, requestKey),
-              isNull(pipelineCases.retiredAt),
-            ))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (existingByRequestKey) return { case: existingByRequestKey, created: false };
-        }
-        const automationAttempt = input.actor.type === "agent"
-          ? await resolveAutomationAttemptForActorRun(tx, input.companyId, input.actor.runId)
-          : null;
-        const blockedByCaseKeyMap = await resolveBlockerCaseKeys(tx, {
-          companyId: input.companyId,
-          pipelineId: input.pipelineId,
-          blockedByCaseKeys: input.blockedByCaseKeys ?? [],
-        });
-        const blockedByCaseIds = await validateBlockerSet(tx, {
-          companyId: input.companyId,
-          caseId: "__new_case__",
-          blockedByCaseIds: [
-            ...(input.blockedByCaseIds ?? []),
-            ...Array.from(blockedByCaseKeyMap.values()),
-          ],
-        });
-        const stage = input.stageKey
-          ? await getStageByKeyOrThrow(tx, input.pipelineId, input.stageKey)
-          : await tx
-            .select()
-            .from(pipelineStages)
-            .where(eq(pipelineStages.pipelineId, input.pipelineId))
-            .orderBy(asc(pipelineStages.position), asc(pipelineStages.createdAt))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-        if (!stage) throw unprocessable("Pipeline has no stages", { code: "validation" });
-        assertStageEnabled(stage, "ingest");
-        validateAddFormFieldsForStage(stage, input.fields ?? {});
-
-        const [inserted] = await tx
-          .insert(pipelineCases)
-          .values({
-            companyId: input.companyId,
-            pipelineId: input.pipelineId,
-            stageId: stage.id,
-            caseKey,
-            title: input.title,
-            summary: input.summary ?? null,
-            fields: input.fields ?? {},
-            workspaceRef: input.workspaceRef ?? null,
-            parentCaseId: input.parentCaseId ?? null,
-            parentCaseVersion: parentCase?.version ?? null,
-            requestKey,
-            automationAttemptId: automationAttempt?.id ?? null,
-            terminalKind: terminalKindForStage(stage.kind),
-            terminalAt: isTerminalKind(stage.kind) ? nowDate() : null,
-            createdByUserId: input.actor.type === "user" ? input.actor.userId : null,
-            createdByAgentId: input.actor.type === "agent" ? input.actor.agentId : null,
-            originRunId: input.actor.type === "agent" ? input.actor.runId : null,
-          })
-          .onConflictDoNothing()
-          .returning();
-
-        if (!inserted) {
-          const existingByRequestKey = requestKey && parentCase
-            ? await tx
-              .select()
-              .from(pipelineCases)
-              .where(and(
-                eq(pipelineCases.companyId, input.companyId),
-                eq(pipelineCases.parentCaseId, parentCase.id),
-                eq(pipelineCases.requestKey, requestKey),
-                isNull(pipelineCases.retiredAt),
-              ))
-              .limit(1)
-              .then((rows) => rows[0] ?? null)
-            : null;
-          const existing = existingByRequestKey ?? await tx
-            .select()
-            .from(pipelineCases)
-            .where(and(eq(pipelineCases.pipelineId, input.pipelineId), eq(pipelineCases.caseKey, caseKey)))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!existing) throw conflict("Pipeline case ingest conflict", { code: "ingest_conflict" });
-          return { case: existing, created: false };
-        }
-
-        await ensurePipelineCaseBodyDocumentFromSummary(tx, {
-          companyId: input.companyId,
-          caseId: inserted.id,
-          summary: input.summary,
-          actor: input.actor,
-        });
-
-        const ingestEvent = await writeCaseEvent(tx, {
-          companyId: input.companyId,
-          caseId: inserted.id,
-          type: "ingested",
-          actor: input.actor,
-          toStageId: stage.id,
-          payload: { caseKey, requestKey, parentCaseVersion: inserted.parentCaseVersion },
-        });
-        await adjustParentCounts(tx, {
-          parentCaseId: inserted.parentCaseId,
-          childDelta: 1,
-          terminalChildDelta: isTerminalKind(inserted.terminalKind) ? 1 : 0,
-        });
-        if (blockedByCaseIds.length > 0) {
-          await tx.insert(pipelineCaseBlockers).values(blockedByCaseIds.map((blockedByCaseId) => ({
-            companyId: input.companyId,
-            caseId: inserted.id,
-            blockedByCaseId,
-          })));
-          await writeCaseEvent(tx, {
-            companyId: input.companyId,
-            caseId: inserted.id,
-            type: "blockers_set",
-            actor: input.actor,
-            payload: {
-              blockedByCaseIds,
-              ...(input.blockedByCaseKeys?.length ? { blockedByCaseKeys: input.blockedByCaseKeys } : {}),
-            },
-          });
-        }
-        if (blockedByCaseIds.length === 0) {
-          const ledger = await enqueueStageAutomationLedger(tx, {
-            companyId: input.companyId,
-            caseId: inserted.id,
-            stage,
-            eventId: ingestEvent.id,
-          });
-          if (ledger) automationLedgers.push(ledger);
-          return { case: inserted, created: true, event: ingestEvent, automationLedger: ledger };
-        }
-        return { case: inserted, created: true, event: ingestEvent, automationLedger: null };
-      });
-      const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
-      if ("automationLedger" in result && result.automationLedger) {
-        return {
-          ...result,
-          automationExecution: automationExecutions.get(result.automationLedger.id) ?? { status: "none" },
-          automationExecutions: [...automationExecutions.values()],
-        };
-      }
-      return { ...result, automationExecution: { status: "none" } satisfies PipelineAutomationExecutionResult };
+    /**
+     * Trusted in-process composition only; this callback is never HTTP input.
+     * Call with the root Db, not an outer transaction cast to Db. The callback
+     * must only persist through tx and must validate its own scope/material on
+     * both creation and native replay. No network or execution side effects.
+     */
+    async ingestCaseWithRelatedRecords<TRelated>(
+      input: PipelineCaseIngestInput,
+      persistRelated: (
+        tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+        ingest: Awaited<ReturnType<typeof ingestPipelineCaseInTransaction>>,
+      ) => Promise<TRelated>,
+    ) {
+      return commitCaseIngest(input, persistRelated);
     },
 
     async ingestCases(input: {

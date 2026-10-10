@@ -32,6 +32,7 @@ import {
 import {
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
   pipelineService,
+  ingestPipelineCaseInTransaction,
   type PipelineActor,
 } from "../services/pipelines.ts";
 import { routineService } from "../services/routines.ts";
@@ -163,6 +164,118 @@ describeEmbeddedPostgres("pipelineService", () => {
     });
     return issue!;
   }
+
+  it("keeps composed ingest intent inside the outer transaction without dispatch", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Deferred entry");
+    const pipeline = await svc.createPipeline({ companyId: company.id, key: "composed-ingest", name: "Composed",
+      actor: userActor, stages: [
+        { key: "intake", name: "Intake", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" }, { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ] });
+    const rollback = new Error("outer rollback");
+    await expect(db.transaction(async tx => {
+      const result = await ingestPipelineCaseInTransaction(tx, { companyId: company.id, pipelineId: pipeline.id,
+        caseKey: "composed", title: "Composed case", summary: "Body kept in the same transaction", actor: userActor });
+      expect(result.created).toBe(true);
+      expect(result.automationLedger).toMatchObject({ status: "failed", error: "pending_dispatch", executionIssueId: null });
+      expect(await tx.select().from(pipelineCaseEvents)).toHaveLength(1);
+      expect(await tx.select().from(routineRuns)).toHaveLength(0);
+      expect(await tx.select().from(issues)).toHaveLength(0);
+      expect(await tx.select().from(heartbeatRuns)).toHaveLength(0);
+      const replay = await ingestPipelineCaseInTransaction(tx, { companyId: company.id, pipelineId: pipeline.id,
+        caseKey: "composed", title: "Composed case", actor: userActor });
+      expect(replay.created).toBe(false);
+      expect(replay.case.id).toBe(result.case.id);
+      expect(await tx.select().from(pipelineAutomationExecutions)).toHaveLength(1);
+      throw rollback;
+    })).rejects.toBe(rollback);
+    expect(await db.select().from(pipelineCases)).toHaveLength(0);
+    expect(await db.select().from(pipelineCaseEvents)).toHaveLength(0);
+    expect(await db.select().from(pipelineAutomationExecutions)).toHaveLength(0);
+    expect(await db.select().from(routineRuns)).toHaveLength(0);
+    expect(await db.select().from(issues)).toHaveLength(0);
+  });
+
+  it("rolls back composed ingest and related writes when the domain callback rejects", async () => {
+    const { company, pipeline } = await seedPipeline();
+    const failure = new Error("binding conflict");
+    await expect(svc.ingestCaseWithRelatedRecords({ companyId: company.id, pipelineId: pipeline.id,
+      caseKey: "related-failure", title: "Related failure", actor: userActor }, async (tx, result) => {
+      await tx.insert(activityLog).values({ companyId: company.id, actorType: "user", actorId: "board-user",
+        action: "fixture.related", entityType: "case", entityId: result.case.id });
+      throw failure;
+    })).rejects.toBe(failure);
+    expect(await db.select().from(pipelineCases)).toHaveLength(0);
+    expect(await db.select().from(pipelineCaseEvents)).toHaveLength(0);
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+
+  it("commits related records before ingest dispatch and calls the callback on replay", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Related entry");
+    const pipeline = await svc.createPipeline({ companyId: company.id, key: "related-ingest", name: "Related",
+      actor: userActor, stages: [
+        { key: "intake", name: "Intake", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" }, { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ] });
+    const input = { companyId: company.id, pipelineId: pipeline.id, caseKey: "related",
+      title: "Related commit", actor: userActor };
+    let calls = 0;
+    const result = await svc.ingestCaseWithRelatedRecords(input, async (tx, ingest) => {
+      calls++;
+      expect(await db.select().from(pipelineCases)).toHaveLength(0);
+      expect(await tx.select().from(routineRuns)).toHaveLength(0);
+      expect(await tx.select().from(issues)).toHaveLength(0);
+      const [row] = await tx.insert(activityLog).values({ companyId: company.id, actorType: "user", actorId: "board-user",
+        action: "fixture.related", entityType: "case", entityId: ingest.case.id }).returning();
+      return row!.id;
+    });
+    expect(result.ingest.automationExecution.status).toBe("succeeded");
+    expect(await db.select().from(activityLog).where(eq(activityLog.id, result.related))).toHaveLength(1);
+    const replay = await svc.ingestCaseWithRelatedRecords(input, async (_tx, ingest) => {
+      calls++;
+      expect(ingest.created).toBe(false);
+      return result.related;
+    });
+    expect(replay.related).toBe(result.related);
+    expect(calls).toBe(2);
+    expect(await db.select().from(routineRuns)).toHaveLength(1);
+  });
+
+  it("rejects ingest transaction casts before writes or dispatch", async () => {
+    const { company, pipeline } = await seedPipeline();
+    const input = { companyId: company.id, pipelineId: pipeline.id, caseKey: "wrong-owner", title: "Wrong owner", actor: userActor };
+    await expect(ingestPipelineCaseInTransaction(db as unknown as Parameters<typeof ingestPipelineCaseInTransaction>[0], input))
+      .rejects.toMatchObject({ status: 409, details: { code: "transaction_required" } });
+    await db.transaction(async tx => {
+      const nestedSvc = pipelineService(tx as unknown as typeof db, { heartbeat: noopHeartbeat });
+      await expect(nestedSvc.ingestCase(input)).rejects.toMatchObject({ status: 409, details: { code: "root_database_required" } });
+      await expect(nestedSvc.ingestCaseWithRelatedRecords(input, async () => undefined))
+        .rejects.toMatchObject({ status: 409, details: { code: "root_database_required" } });
+      expect(await tx.select().from(pipelineCases)).toHaveLength(0);
+    });
+  });
+
+  it("preserves public ingest dispatch after its transaction commits", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Public entry");
+    const pipeline = await svc.createPipeline({ companyId: company.id, key: "public-ingest", name: "Public",
+      actor: userActor, stages: [
+        { key: "intake", name: "Intake", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" }, { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ] });
+    const input = { companyId: company.id, pipelineId: pipeline.id, caseKey: "public",
+      title: "Public ingest dispatch", actor: userActor };
+    const result = await svc.ingestCase(input);
+    expect(result.created).toBe(true);
+    expect(result.automationExecution.status).toBe("succeeded");
+    const replay = await svc.ingestCase(input);
+    expect(replay.created).toBe(false);
+    expect(replay.case.id).toBe(result.case.id);
+    expect(await db.select().from(routineRuns)).toHaveLength(1);
+    expect(await db.select().from(pipelineCaseIssueLinks)).toHaveLength(1);
+  });
 
   it("seeds default stages and protects non-empty stage deletion", async () => {
     const { company, pipeline, byKey } = await seedPipeline();
