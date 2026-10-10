@@ -5,12 +5,15 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createDb, companies, projects, projectAccessMembers, pipelines, pipelineStages, pipelineCases, pipelineCaseEvents,
   pipelineAutomationExecutions, documents, activityLog, issues, routines, routineRuns, heartbeatRuns,
   pipelineTransitions, onisallIntakeDrafts, onisallInputObservations, onisallInputSnapshots, onisallNativeBindings,
-  onisallPreparationBaselines } from "@paperclipai/db";
+  onisallPreparationBaselines, onisallFrozenSchemaSetMembers, onisallFrozenSchemaSets, onisallSchemaVersions } from "@paperclipai/db";
 import type { CreateOnisallBinding, OnisallBindingContext } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { onisallNativeBindingService } from "../services/onisall/native-bindings.js";
 import { onisallIntakeDraftService } from "../services/onisall/intake-drafts.js";
 import { pipelineService } from "../services/pipelines.js";
+import { companyService } from "../services/companies.js";
+import { onisallFrozenSchemaSetService } from "../services/onisall/frozen-schema-sets.js";
+import { createOfflineSchemaRegistry } from "../services/onisall/schema-registry.js";
 import type { StorageService } from "../storage/types.js";
 import type { AuthorizationActor } from "../services/authorization.js";
 
@@ -48,6 +51,9 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
   afterEach(async () => {
     beforeRead = undefined;
     // Dedicated test database only, never the development instance.
+    await db.delete(onisallFrozenSchemaSetMembers);
+    await db.delete(onisallFrozenSchemaSets);
+    await db.delete(onisallSchemaVersions);
     await db.delete(onisallPreparationBaselines);
     await db.delete(onisallNativeBindings);
     await db.delete(onisallInputObservations);
@@ -89,6 +95,25 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
     const { baseline } = await f.intakeSvc.createPreparationBaseline(f.company.id, f.draft.id, { requestKey: "baseline" });
     return { ...f, binding, baseline };
   }
+  it("native company removal cleans frozen rules and baselines before their dependencies, preserving the other company", async () => {
+    const f = await freeze(), other = await freeze();
+    const bytes = Buffer.from(JSON.stringify({ type: "null" }));
+    const ref = { registry_key: "fixture/null", revision: "1", sha256: createHash("sha256").update(bytes).digest("hex") };
+    const registry = createOfflineSchemaRegistry([{ ref, bytes }]);
+    const schemas = onisallFrozenSchemaSetService(db, actor);
+    await schemas.freeze(f.company.id, registry, [ref]);
+    const retained = await schemas.freeze(other.company.id, registry, [ref]);
+    // Native destructive service exercised only against this dedicated temporary DB.
+    expect(await companyService(db).remove(f.company.id)).toMatchObject({ id: f.company.id });
+    for (const table of [onisallFrozenSchemaSetMembers, onisallFrozenSchemaSets, onisallSchemaVersions,
+      onisallPreparationBaselines, onisallNativeBindings, onisallIntakeDrafts, onisallInputSnapshots, projects]) {
+      expect(await db.select().from(table).where(eq(table.companyId, f.company.id))).toHaveLength(0);
+    }
+    expect((await schemas.get(other.company.id, retained.set.id)).integrity).toBe("verified");
+    expect((await other.intakeSvc.preparationBaselineStatus(other.company.id, other.draft.id, other.baseline.id)).comparison.status).toBe("matches");
+    expect(await db.select().from(onisallPreparationBaselines)).toHaveLength(1);
+    expect(await companyService(db).remove(f.company.id)).toBeNull();
+  });
   it("persists complete workflow bytes and audit, without changing native authority", async () => {
     const f = await freeze();
     const [row] = await db.select().from(onisallPreparationBaselines);

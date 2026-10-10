@@ -127,6 +127,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { onisallIntakeRoutes } from "./routes/onisall-intakes.js";
+import { onisallSchemaSetRoutes } from "./routes/onisall-schema-sets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import {
@@ -785,6 +786,7 @@ export async function createApp(
   );
   api.use(assetRoutes(db, opts.storageService));
   api.use(onisallIntakeRoutes(db, opts.storageService));
+  api.use(onisallSchemaSetRoutes(db));
   api.use(agentProfileAvatarRoutes(db, opts.storageService));
   api.use(projectToolRoutes(db));
   api.use(projectRoutes(db));

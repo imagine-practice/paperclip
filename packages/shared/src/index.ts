@@ -2859,3 +2859,4 @@ export * from "./agent-avatar-upload.js";
 
 export type { DotBinding, DotInvitation, DotConnection, DotPairing } from "./dot-invitations.js";
 export * from "./onisall-intakes.js";
+export * from "./onisall-schema-sets.js";
