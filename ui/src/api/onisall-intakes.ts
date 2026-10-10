@@ -1,6 +1,6 @@
 import type { CreateOnisallIntakeDraft, ObserveOnisallInput, OnisallIntakeDraft,
   OnisallInputObservation, OnisallObservationPage, OnisallNativeBinding, OnisallBindingContext,
-  OnisallBindingContextInput, CreateOnisallBinding } from "@paperclipai/shared";
+  OnisallBindingContextInput, CreateOnisallBinding, OnisallPreparationStatus } from "@paperclipai/shared";
 import { api } from "./client";
 
 const base = (companyId: string) => `/companies/${encodeURIComponent(companyId)}/onisall/intakes`;
@@ -8,6 +8,8 @@ export const onisallIntakesApi = {
   create: (companyId: string, input: CreateOnisallIntakeDraft) =>
     api.post<{ draft: OnisallIntakeDraft; replayed: boolean }>(base(companyId), input),
   get: (companyId: string, id: string) => api.get<OnisallIntakeDraft>(`${base(companyId)}/${encodeURIComponent(id)}`),
+  preparationStatus: (companyId: string, id: string) =>
+    api.get<OnisallPreparationStatus>(`${base(companyId)}/${encodeURIComponent(id)}/preparation-status`),
   observe: (companyId: string, id: string, input: ObserveOnisallInput) =>
     api.post<{ observation: OnisallInputObservation; replayed: boolean }>(`${base(companyId)}/${encodeURIComponent(id)}/observations`, input),
   observations: (companyId: string, id: string, offset = 0) =>

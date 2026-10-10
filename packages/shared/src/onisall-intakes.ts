@@ -1,5 +1,33 @@
 import { z } from "zod";
 
+/** Read-only observations, never a publication decision or execution credential. */
+export interface OnisallPreparationStatus {
+  protocol: "onisall.intake-preparation-status.v1";
+  evaluatedAt: string;
+  companyId: string;
+  intakeId: string;
+  diagnosticsOnly: true;
+  input: {
+    status: "verified";
+    snapshotId: string;
+    sha256: string;
+    byteSize: number;
+    lineCount: number;
+  };
+  nativeBinding: { status: "pending" } | {
+    status: "recorded";
+    bindingId: string;
+    caseId: string;
+    revision: 1;
+  };
+  publication: { status: "unavailable"; reason: "publication_not_implemented"; executionAdmission: "not_granted" };
+  remainingChecks: Array<{
+    code: "native_current_head" | "contract_preflight" | "checks_and_independent_review"
+      | "human_decisions" | "execution_qualification" | "budget_and_permissions";
+    status: "not_evaluated";
+  }>;
+}
+
 // Draft transport v2 is deliberately separate from published TaskContract v3.
 export const ONISALL_INTAKE_DRAFT_VERSION = 2 as const;
 export const ONISALL_INPUT_MAX_BYTES = 1024 * 1024;

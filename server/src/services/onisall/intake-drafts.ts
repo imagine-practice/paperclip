@@ -10,6 +10,7 @@ import type { StorageService } from "../../storage/types.js";
 import { conflict, notFound, unprocessable } from "../../errors.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { captureInputText, InputSnapshotError, MAX_INPUT_BYTES, sha256 } from "./input-snapshot.js";
+import { preparationStatus } from "./preparation-status.js";
 
 type Snapshot = typeof snapshots.$inferSelect;
 type Draft = typeof drafts.$inferSelect;
@@ -151,6 +152,19 @@ export function onisallIntakeDraftService(db: Db, storage: StorageService, actor
       const row = await findDraft(db, companyId, id);
       const snapshot = await findSnapshot(db, companyId, row.initialSnapshotId);
       return { bytes: await readVerified(snapshot), sha256: snapshot.sha256 };
+    },
+    async preparationStatus(companyId: string, id: string) {
+      // A single DB snapshot prevents mixing pending/bound projections during
+      // a concurrent bind. Object bytes are independently verified; this read
+      // neither locks future publication nor attests native Case freshness.
+      return db.transaction(async tx => {
+        const row = await findDraft(tx, companyId, id);
+        await activeCompany(tx, companyId);
+        const snapshot = await findSnapshot(tx, companyId, row.initialSnapshotId);
+        const draft = await draftView(tx, row, snapshot, actor);
+        const bytes = await readVerified(snapshot);
+        return preparationStatus(draft, bytes, new Date());
+      }, { isolationLevel: "repeatable read", accessMode: "read only" });
     },
     async observe(companyId: string, id: string, actorId: string, input: ObserveOnisallInput) {
       const data = observeOnisallInputSchema.parse(input);

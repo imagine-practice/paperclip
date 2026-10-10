@@ -94,6 +94,56 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
     expect(await db.select().from(issues)).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
   });
+  it("reads pending and bound preparation status without any persistent effects", async () => {
+    const f = await setup();
+    const pending = await f.intakeSvc.preparationStatus(f.company.id, f.draft.id);
+    expect(pending.nativeBinding).toEqual({ status: "pending" });
+    expect(pending.input.sha256).toBe(f.draft.initialSnapshot.sha256);
+    expect(await db.select().from(pipelineCases)).toHaveLength(0);
+    const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    async function counts() {
+      return Promise.all([activityLog, pipelineCases, pipelineCaseEvents, onisallInputObservations,
+        pipelineAutomationExecutions, issues, heartbeatRuns].map(async table => (await db.select().from(table)).length));
+    }
+    const before = await counts();
+    const result = await f.intakeSvc.preparationStatus(f.company.id, f.draft.id);
+    expect(result.nativeBinding).toEqual({ status: "recorded", bindingId: binding.id, caseId: binding.caseId, revision: 1 });
+    expect(result.publication.executionAdmission).toBe("not_granted");
+    expect(await counts()).toEqual(before);
+    // Presence stays a recorded fact even if native state later moves. The
+    // current-head prerequisite must remain explicitly unevaluated.
+    await f.native.transitionCase({ companyId: f.company.id, caseId: binding.caseId,
+      toStageKey: "in_progress", expectedVersion: 1, actor: { type: "user", userId: "owner" } });
+    const moved = await f.intakeSvc.preparationStatus(f.company.id, f.draft.id);
+    expect(moved.remainingChecks).toContainEqual({ code: "native_current_head", status: "not_evaluated" });
+    expect(moved.publication.executionAdmission).toBe("not_granted");
+  });
+  it("fails the diagnostic on changed stored bytes or database metadata", async () => {
+    const f = await setup();
+    const [snapshot] = await db.select().from(onisallInputSnapshots);
+    const original = blobs.get(snapshot!.objectKey)!;
+    blobs.set(snapshot!.objectKey, Buffer.from("corrupted"));
+    await expect(f.intakeSvc.preparationStatus(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 409 });
+    blobs.set(snapshot!.objectKey, original);
+    await db.update(onisallInputSnapshots).set({ lineCount: 900 }).where(eq(onisallInputSnapshots.id, snapshot!.id));
+    await expect(f.intakeSvc.preparationStatus(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 409 });
+    await db.update(onisallInputSnapshots).set({ lineCount: 2 }).where(eq(onisallInputSnapshots.id, snapshot!.id));
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    await db.update(onisallNativeBindings).set({ inputSha256: "a".repeat(64) });
+    await expect(f.intakeSvc.preparationStatus(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 409 });
+  });
+  it("keeps status scoped to the company and private Project and rejects inactive companies", async () => {
+    const f = await setup(true);
+    await expect(f.intakeSvc.preparationStatus(randomUUID(), f.draft.id)).rejects.toMatchObject({ status: 404 });
+    const [paused] = await db.insert(companies).values({ name: "Paused foreign company", issuePrefix: "PAU", status: "paused" }).returning();
+    await expect(f.intakeSvc.preparationStatus(paused!.id, f.draft.id)).rejects.toMatchObject({ status: 404 });
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    const outsider: AuthorizationActor = { type: "board", userId: "outsider", source: "session", companyIds: [f.company.id] };
+    await expect(onisallIntakeDraftService(db, storage, outsider).preparationStatus(f.company.id, f.draft.id))
+      .rejects.toMatchObject({ status: 404 });
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.company.id));
+    await expect(f.intakeSvc.preparationStatus(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 409 });
+  });
   it("serializes simultaneous binding requests to one Case and binding", async () => {
     const f = await setup();
     const results = await Promise.all(Array.from({ length: 4 }, () => f.service.bind(f.company.id, f.draft.id, f.request)));

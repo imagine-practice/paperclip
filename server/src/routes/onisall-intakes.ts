@@ -38,6 +38,10 @@ export function onisallIntakeRoutes(db: Db, storage: StorageService) {
     res.setHeader("X-Onisall-Input-Sha256", result.sha256);
     res.send(result.bytes);
   });
+  router.get(`${base}/:id/preparation-status`, async (req, res) => {
+    z.strictObject({}).parse(req.query);
+    res.json(await svc(req).preparationStatus(req.params.companyId as string, z.string().uuid().parse(req.params.id)));
+  });
   router.post(`${base}/:id/observations`, validate(observeOnisallInputSchema), async (req, res) => {
     const result = await svc(req).observe(req.params.companyId as string, z.string().uuid().parse(req.params.id), req.actor.userId!, req.body);
     res.status(result.replayed ? 200 : 201).json(result);
