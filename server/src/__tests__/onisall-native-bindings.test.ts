@@ -4,7 +4,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createDb, companies, projects, projectAccessMembers, pipelines, pipelineStages, pipelineCases, pipelineCaseEvents,
   pipelineAutomationExecutions, documents, activityLog, issues, routines, routineRuns, heartbeatRuns,
-  onisallIntakeDrafts, onisallInputObservations, onisallInputSnapshots, onisallNativeBindings } from "@paperclipai/db";
+  pipelineTransitions, onisallIntakeDrafts, onisallInputObservations, onisallInputSnapshots, onisallNativeBindings } from "@paperclipai/db";
 import type { CreateOnisallBinding, OnisallBindingContext } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { onisallNativeBindingService } from "../services/onisall/native-bindings.js";
@@ -23,6 +23,7 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
   let fixture: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   const blobs = new Map<string, Buffer>();
+  let beforeRead: (() => Promise<void>) | undefined;
   const storage: StorageService = {
     provider: "local_disk",
     async putFile(input) {
@@ -32,7 +33,10 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
         sha256: createHash("sha256").update(input.body).digest("hex"), contentType: input.contentType,
         originalFilename: input.originalFilename };
     },
-    async getObject(_company, key) { return { stream: Readable.from([blobs.get(key)!]) }; },
+    async getObject(_company, key) {
+      await beforeRead?.();
+      return { stream: Readable.from([blobs.get(key)!]) };
+    },
     async headObject() { throw new Error("Not used"); },
     async deleteObject() { throw new Error("Unexpected deletion"); },
   };
@@ -41,6 +45,7 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
     db = createDb(fixture.connectionString);
   }, 30_000);
   afterEach(async () => {
+    beforeRead = undefined;
     // Dedicated test database only, never the development instance.
     await db.delete(onisallNativeBindings);
     await db.delete(onisallInputObservations);
@@ -76,6 +81,164 @@ function request(context: OnisallBindingContext): CreateOnisallBinding {
     const context = await service.context(company!.id, draft.id, { pipelineId: pipeline.id, entryStageKey: "intake" });
     return { company: company!, project, pipeline, draft, service, native, intakeSvc, input, request: request(context) };
   }
+  it("revalidates real input and native current head with no effects or replayable authority", async () => {
+    const f = await setup();
+    expect((await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).native).toEqual({ status: "pending" });
+    const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    const before = await Promise.all([pipelineCases, pipelineCaseEvents, onisallNativeBindings, activityLog,
+      onisallInputObservations, pipelineAutomationExecutions, issues, heartbeatRuns].map(async table => await db.select().from(table)));
+    const result = await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id);
+    expect(result).toMatchObject({ protocol: "onisall.native-revalidation.v1", diagnosticsOnly: true,
+      input: { status: "verified", snapshotId: binding.snapshotId },
+      native: { status: "consistent", blockers: [], bindingId: binding.id, head: { version: 1, caseId: binding.caseId,
+        stageKey: "intake", retired: false }, configuration: { status: "matches_binding", workflowBaseline: "not_frozen" } },
+      publication: { status: "unavailable", executionAdmission: "not_granted" } });
+    for (const key of ["fields", "leaseToken", "goal", "sourceLabel", "objectKey", "requestHash", "contentBase64"]) {
+      expect(JSON.stringify(result)).not.toContain(`"${key}"`);
+    }
+    const after = await Promise.all([pipelineCases, pipelineCaseEvents, onisallNativeBindings, activityLog,
+      onisallInputObservations, pipelineAutomationExecutions, issues, heartbeatRuns].map(async table => await db.select().from(table)));
+    expect(after).toEqual(before);
+    // Native edits can increment version without moving the Case. We observe
+    // the real version, never synthesize one from binding revision=1.
+    await db.update(pipelineCases).set({ version: 3 }).where(eq(pipelineCases.id, binding.caseId));
+    expect((await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).native)
+      .toMatchObject({ status: "consistent", head: { version: 3 } });
+  });
+  it.each(["move", "terminal", "retire", "archive", "disable", "automation", "ledger"])("blocks current native %s state", async change => {
+    const f = await setup();
+    const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    let reason: string;
+    if (change === "move" || change === "terminal") {
+      await f.native.transitionCase({ companyId: f.company.id, caseId: binding.caseId,
+        toStageKey: change === "move" ? "in_progress" : "done", expectedVersion: 1, actor: { type: "user", userId: "owner" } });
+      reason = change === "move" ? "case_left_entry_stage" : "case_terminal";
+    } else if (change === "retire") {
+      await db.update(pipelineCases).set({ retiredAt: new Date() }).where(eq(pipelineCases.id, binding.caseId));
+      reason = "case_retired";
+    } else if (change === "archive") {
+      await db.update(pipelines).set({ archivedAt: new Date() }).where(eq(pipelines.id, f.pipeline.id));
+      reason = "pipeline_archived";
+    } else if (change === "ledger") {
+      const [routine] = await db.insert(routines).values({ companyId: f.company.id, title: "Synthetic prior automation" }).returning();
+      await db.insert(pipelineAutomationExecutions).values({ companyId: f.company.id, caseId: binding.caseId,
+        automationId: "synthetic", triggeringEventId: randomUUID(), routineId: routine!.id, status: "failed" });
+      reason = "automation_execution_exists";
+    } else {
+      await db.update(pipelineStages).set({ config: change === "disable" ? { disabled: true } : { onEnter: {} } })
+        .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "intake")));
+      reason = "entry_stage_unavailable";
+    }
+    const result = await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id);
+    expect(result.native).toMatchObject({ status: "blocked", blockers: expect.arrayContaining([reason]) });
+    expect(result.publication.executionAdmission).toBe("not_granted");
+    expect(await db.select().from(issues)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+  });
+  it.each(["archived", "paused", "completed", "cancelled"])("blocks a %s Project", async change => {
+    const f = await setup(true);
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    await db.update(projects).set(change === "archived" ? { archivedAt: new Date() } : change === "paused"
+      ? { pausedAt: new Date() } : { status: change }).where(eq(projects.id, f.project!.id));
+    expect((await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).native).toMatchObject({ status: "blocked",
+      blockers: expect.arrayContaining([change === "archived" ? "project_archived" : change === "paused" ? "project_paused" : "project_terminal"]) });
+  });
+  it.each(["marker", "caseKey", "version", "input", "request", "project"])("refuses inconsistent %s without returning native data", async change => {
+    const f = await setup();
+    const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    if (change === "marker") await db.update(pipelineCases).set({ fields: { onisall: { purpose: "preparation" } } }).where(eq(pipelineCases.id, binding.caseId));
+    if (change === "caseKey") await db.update(pipelineCases).set({ caseKey: "different" }).where(eq(pipelineCases.id, binding.caseId));
+    if (change === "version") await db.update(pipelineCases).set({ version: 0 }).where(eq(pipelineCases.id, binding.caseId));
+    if (change === "input") await db.update(onisallNativeBindings).set({ inputSha256: "a".repeat(64) });
+    if (change === "request") await db.update(onisallIntakeDrafts).set({ requestHash: "a".repeat(64) });
+    if (change === "project") {
+      const [project] = await db.insert(projects).values({ companyId: f.company.id, name: "Changed project" }).returning();
+      await db.update(pipelines).set({ projectId: project!.id }).where(eq(pipelines.id, f.pipeline.id));
+    }
+    await expect(f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 409 });
+  });
+  it("enforces both recorded and current Project privacy, company scope and direct board", async () => {
+    const f = await setup(true);
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    const outsider: AuthorizationActor = { type: "board", userId: "outsider", source: "session", companyIds: [f.company.id] };
+    await expect(onisallIntakeDraftService(db, storage, outsider).nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 404 });
+    const [other] = await db.insert(companies).values({ name: "Foreign", issuePrefix: "FRG", status: "paused" }).returning();
+    await expect(f.intakeSvc.nativeRevalidation(other!.id, f.draft.id)).rejects.toMatchObject({ status: 404 });
+    const [hidden] = await db.insert(projects).values({ companyId: f.company.id, name: "Hidden", visibility: "private" }).returning();
+    await db.update(pipelines).set({ projectId: hidden!.id }).where(eq(pipelines.id, f.pipeline.id));
+    const member: AuthorizationActor = { type: "board", userId: "owner", source: "session", companyIds: [f.company.id] };
+    await expect(onisallIntakeDraftService(db, storage, member).nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 404 });
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.company.id));
+    await expect(f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 409 });
+    await expect(onisallIntakeDraftService(db, storage).nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 403 });
+    await expect(onisallIntakeDraftService(db, storage, { ...actor, source: "mcp_oauth" }).nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: 403 });
+  });
+  it("detects entry/Pipeline changes and observes other Stage/Transition changes without claiming a frozen workflow", async () => {
+    const f = await setup();
+    await f.service.bind(f.company.id, f.draft.id, f.request);
+    const read = async () => {
+      const { native } = await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id);
+      if (native.status === "pending") throw new Error("Expected native head");
+      return native;
+    };
+    const baseline = await read();
+    await db.update(pipelineStages).set({ config: { requireApproval: false } })
+      .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "review")));
+    const stageChanged = await read();
+    expect(stageChanged.configuration.status).toBe("matches_binding");
+    expect(stageChanged.configuration.workflowHash).not.toBe(baseline.configuration.workflowHash);
+    expect(stageChanged.configuration.workflowBaseline).toBe("not_frozen");
+    const stages = await db.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, f.pipeline.id));
+    await db.insert(pipelineTransitions).values({ pipelineId: f.pipeline.id, fromStageId: stages[0]!.id, toStageId: stages[1]!.id, label: "Changed edge" })
+      .onConflictDoUpdate({ target: [pipelineTransitions.pipelineId, pipelineTransitions.fromStageId, pipelineTransitions.toStageId], set: { label: "Changed edge" } });
+    expect((await read()).configuration.workflowHash).not.toBe(stageChanged.configuration.workflowHash);
+    await db.update(pipelines).set({ enforceTransitions: true }).where(eq(pipelines.id, f.pipeline.id));
+    expect(await read()).toMatchObject({ status: "blocked", blockers: expect.arrayContaining(["preparation_configuration_changed"]) });
+  });
+  it("reports a removed entry Stage without inventing a configuration hash", async () => {
+    const f = await setup();
+    const { binding } = await f.service.bind(f.company.id, f.draft.id, f.request);
+    await f.native.transitionCase({ companyId: f.company.id, caseId: binding.caseId,
+      toStageKey: "in_progress", expectedVersion: 1, actor: { type: "user", userId: "owner" } });
+    // Keep the immutable event history while emulating a missing entry key.
+    await db.update(pipelineStages).set({ key: "renamed-entry" })
+      .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "intake")));
+    expect((await f.intakeSvc.nativeRevalidation(f.company.id, f.draft.id)).native).toMatchObject({ status: "blocked",
+      blockers: expect.arrayContaining(["entry_stage_missing", "preparation_configuration_changed"]),
+      configuration: { currentBindingHash: null, status: "changed" } });
+  });
+  it.each(["case", "entry", "input", "company", "binding", "project", "privacy"])("keeps one snapshot during concurrent %s commit, then rereads on the next request", async change => {
+    const f = await setup(change === "project" || change === "privacy");
+    const svc = onisallIntakeDraftService(db, storage, { type: "board", userId: "owner", source: "session", companyIds: [f.company.id] });
+    const binding = change === "binding" ? null : (await f.service.bind(f.company.id, f.draft.id, f.request)).binding;
+    let arrived!: () => void;
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { arrived = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    beforeRead = async () => { arrived(); await hold; };
+    const inFlight = svc.nativeRevalidation(f.company.id, f.draft.id);
+    await ready;
+    beforeRead = undefined;
+    try {
+      if (change === "case") await f.native.transitionCase({ companyId: f.company.id, caseId: binding!.caseId,
+        toStageKey: "in_progress", expectedVersion: 1, actor: { type: "user", userId: "owner" } });
+      if (change === "entry") await db.update(pipelineStages).set({ config: { disabled: true } })
+        .where(and(eq(pipelineStages.pipelineId, f.pipeline.id), eq(pipelineStages.key, "intake")));
+      if (change === "input") await db.update(onisallInputSnapshots).set({ lineCount: 999 });
+      if (change === "company") await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.company.id));
+      if (change === "binding") await f.service.bind(f.company.id, f.draft.id, f.request);
+      if (change === "project") await db.update(projects).set({ pausedAt: new Date() }).where(eq(projects.id, f.project!.id));
+      if (change === "privacy") await db.delete(projectAccessMembers).where(eq(projectAccessMembers.projectId, f.project!.id));
+    } finally { release(); }
+    expect((await inFlight).native).toMatchObject(change === "binding" ? { status: "pending" }
+      : { status: "consistent", head: { version: 1, stageKey: "intake" } });
+    if (change === "input" || change === "company" || change === "privacy") {
+      await expect(svc.nativeRevalidation(f.company.id, f.draft.id)).rejects.toMatchObject({ status: change === "privacy" ? 404 : 409 });
+    } else {
+      expect((await svc.nativeRevalidation(f.company.id, f.draft.id)).native).toMatchObject(change === "binding"
+        ? { status: "consistent" } : { status: "blocked" });
+    }
+  });
   it("atomically binds the draft and native Case, preserving the input and no execution authority", async () => {
     const f = await setup();
     const first = await f.service.bind(f.company.id, f.draft.id, f.request);

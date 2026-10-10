@@ -1,5 +1,31 @@
 import { z } from "zod";
 
+export type OnisallNativeRevalidationBlocker = "pipeline_archived" | "case_retired" | "case_terminal"
+  | "case_left_entry_stage" | "entry_stage_missing" | "entry_stage_unavailable" | "current_stage_unavailable"
+  | "preparation_configuration_changed" | "automation_execution_exists" | "project_archived"
+  | "project_paused" | "project_terminal";
+
+/** Point-in-time preparation consistency, never a replayable publication proof. */
+export interface OnisallNativeRevalidation {
+  protocol: "onisall.native-revalidation.v1";
+  evaluatedAt: string;
+  companyId: string;
+  intakeId: string;
+  diagnosticsOnly: true;
+  input: OnisallPreparationStatus["input"];
+  native: { status: "pending" } | {
+    status: "consistent" | "blocked";
+    blockers: OnisallNativeRevalidationBlocker[];
+    bindingId: string;
+    bindingRevision: 1;
+    head: { caseId: string; version: number; pipelineId: string; projectId: string | null;
+      stageId: string; stageKey: string; stageKind: string; retired: boolean; terminalKind: string | null };
+    configuration: { status: "matches_binding" | "changed"; bindingHash: string; currentBindingHash: string | null;
+      workflowHash: string; workflowBaseline: "not_frozen" };
+  };
+  publication: OnisallPreparationStatus["publication"];
+}
+
 /** Read-only observations, never a publication decision or execution credential. */
 export interface OnisallPreparationStatus {
   protocol: "onisall.intake-preparation-status.v1";

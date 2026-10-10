@@ -7,10 +7,12 @@ import { createOnisallIntakeDraftSchema, observeOnisallInputSchema,
 import { readIntakeBinding, bindingView } from "./binding-view.js";
 import type { AuthorizationActor } from "../authorization.js";
 import type { StorageService } from "../../storage/types.js";
-import { conflict, notFound, unprocessable } from "../../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../../errors.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { captureInputText, InputSnapshotError, MAX_INPUT_BYTES, sha256 } from "./input-snapshot.js";
 import { preparationStatus } from "./preparation-status.js";
+import { revalidateNativeBindingInTransaction } from "./native-revalidation.js";
+import type { OnisallNativeRevalidation } from "@paperclipai/shared";
 
 type Snapshot = typeof snapshots.$inferSelect;
 type Draft = typeof drafts.$inferSelect;
@@ -164,6 +166,21 @@ export function onisallIntakeDraftService(db: Db, storage: StorageService, actor
         const draft = await draftView(tx, row, snapshot, actor);
         const bytes = await readVerified(snapshot);
         return preparationStatus(draft, bytes, new Date());
+      }, { isolationLevel: "repeatable read", accessMode: "read only" });
+    },
+    async nativeRevalidation(companyId: string, id: string): Promise<OnisallNativeRevalidation> {
+      if (!actor || actor.type !== "board" || !actor.userId || actor.source === "mcp_oauth") {
+        throw forbidden("Direct board session required");
+      }
+      return db.transaction(async tx => {
+        const row = await findDraft(tx, companyId, id);
+        await activeCompany(tx, companyId);
+        const snapshot = await findSnapshot(tx, companyId, row.initialSnapshotId);
+        const draft = await draftView(tx, row, snapshot, actor);
+        const preparation = preparationStatus(draft, await readVerified(snapshot), new Date());
+        const native = await revalidateNativeBindingInTransaction(tx, companyId, id, actor, preparation.input);
+        return { protocol: "onisall.native-revalidation.v1", evaluatedAt: new Date().toISOString(), companyId, intakeId: id,
+          diagnosticsOnly: true, input: preparation.input, native, publication: preparation.publication };
       }, { isolationLevel: "repeatable read", accessMode: "read only" });
     },
     async observe(companyId: string, id: string, actorId: string, input: ObserveOnisallInput) {

@@ -11,20 +11,10 @@ import type { AuthorizationActor } from "../authorization.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { onisallIntakeDraftService } from "./intake-drafts.js";
 import { assertBindingProjectVisible, readIntakeBinding, bindingView } from "./binding-view.js";
-import { sha256 } from "./input-snapshot.js";
+import { bindingDigest as digest, bindingConfigurationHash } from "./binding-configuration.js";
 import type { StorageService } from "../../storage/types.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-function digest(value: unknown) { return sha256(Buffer.from(canonical(value), "utf8")); }
-
 export function onisallNativeBindingService(db: Db, storage: StorageService, actor: AuthorizationActor) {
   function directBoard() {
     if (actor.type !== "board" || !actor.userId || actor.source === "mcp_oauth") throw forbidden("Direct board session required");
@@ -62,10 +52,7 @@ export function onisallNativeBindingService(db: Db, storage: StorageService, act
         throw conflict("Project is not available for preparation");
       }
     }
-    const configurationHash = digest(["onisall.binding-context.v1", {
-      id: pipeline.id, companyId: pipeline.companyId, projectId: pipeline.projectId,
-      enforceTransitions: pipeline.enforceTransitions, updatedAt: pipeline.updatedAt.toISOString(),
-    }, { id: stage.id, key: stage.key, kind: stage.kind, config: stage.config, updatedAt: stage.updatedAt.toISOString() }]);
+    const configurationHash = bindingConfigurationHash(pipeline, stage);
     return { draft, snapshot, pipeline, stage, existing, configurationHash };
   }
   return {

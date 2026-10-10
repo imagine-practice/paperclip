@@ -1548,6 +1548,20 @@ async function getCaseWithStageOrThrow(db: PipelineDb, companyId: string, caseId
   return row;
 }
 
+/** DB-only native observation for composed reads. Caller owns the transaction,
+ * authorization and isolation/locks; this never expires a lease or dispatches. */
+export async function readPipelineCaseInTransaction(
+  tx: Parameters<Parameters<Db["transaction"]>[0]>[0], companyId: string, caseId: string,
+) {
+  if (!is(tx, PgTransaction)) throw new Error("Native Case read requires a transaction");
+  const detail = await getCaseWithStageOrThrow(tx, companyId, caseId);
+  const stages = await tx.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, detail.pipeline.id));
+  const transitions = await tx.select().from(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, detail.pipeline.id));
+  const ledger = await tx.select({ id: pipelineAutomationExecutions.id }).from(pipelineAutomationExecutions)
+    .where(and(eq(pipelineAutomationExecutions.companyId, companyId), eq(pipelineAutomationExecutions.caseId, caseId))).limit(1);
+  return { ...detail, stages, transitions, hasAutomationExecution: ledger.length > 0 };
+}
+
 async function getCaseWithStageForUpdateOrThrow(db: PipelineDb, companyId: string, caseId: string) {
   const locked = await db.execute(sql<{ id: string }>`
     select id from pipeline_cases

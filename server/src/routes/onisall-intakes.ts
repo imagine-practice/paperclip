@@ -42,6 +42,10 @@ export function onisallIntakeRoutes(db: Db, storage: StorageService) {
     z.strictObject({}).parse(req.query);
     res.json(await svc(req).preparationStatus(req.params.companyId as string, z.string().uuid().parse(req.params.id)));
   });
+  router.get(`${base}/:id/native-revalidation`, async (req, res) => {
+    z.strictObject({}).parse(req.query);
+    res.json(await svc(req).nativeRevalidation(req.params.companyId as string, z.string().uuid().parse(req.params.id)));
+  });
   router.post(`${base}/:id/observations`, validate(observeOnisallInputSchema), async (req, res) => {
     const result = await svc(req).observe(req.params.companyId as string, z.string().uuid().parse(req.params.id), req.actor.userId!, req.body);
     res.status(result.replayed ? 200 : 201).json(result);

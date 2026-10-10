@@ -10,7 +10,7 @@ import { createHttpLogger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { HttpError } from "../errors.js";
 
-const svc = vi.hoisted(() => ({ create: vi.fn(), get: vi.fn(), observe: vi.fn(), observations: vi.fn(), content: vi.fn(), preparationStatus: vi.fn() }));
+const svc = vi.hoisted(() => ({ create: vi.fn(), get: vi.fn(), observe: vi.fn(), observations: vi.fn(), content: vi.fn(), preparationStatus: vi.fn(), nativeRevalidation: vi.fn() }));
 const binding = vi.hoisted(() => ({ context: vi.fn(), get: vi.fn(), bind: vi.fn() }));
 vi.mock("../services/onisall/native-bindings.js", () => ({ onisallNativeBindingService: () => binding }));
 vi.mock("../services/onisall/intake-drafts.js", () => ({ onisallIntakeDraftService: () => svc }));
@@ -36,6 +36,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   svc.get.mockResolvedValue({ id });
   svc.preparationStatus.mockResolvedValue({ intakeId: id, diagnosticsOnly: true });
+  svc.nativeRevalidation.mockResolvedValue({ intakeId: id, diagnosticsOnly: true });
   binding.get.mockResolvedValue({ binding: null });
   binding.bind.mockResolvedValue({ binding: { id }, replayed: false });
   binding.context.mockResolvedValue({ intakeId: id });
@@ -44,27 +45,28 @@ beforeEach(() => {
   svc.content.mockResolvedValue({ bytes: Buffer.from("a"), sha256: "a".repeat(64) });
 });
 
-describe("OnisAll preparation status route (injected actors)", () => {
+describe.each(["preparation-status", "native-revalidation"])("OnisAll %s route (injected actors)", endpoint => {
+  const read = () => endpoint === "preparation-status" ? svc.preparationStatus : svc.nativeRevalidation;
   it.each([{ type: "none" }, { type: "agent", companyId: company, agentId: id },
     { ...board, source: "mcp_oauth" }, { ...board, companyIds: [] }])("rejects unauthorized status reads", async actor => {
-    await request(appFor(actor)).get(`${base}/${id}/preparation-status`).expect(403);
-    expect(svc.preparationStatus).not.toHaveBeenCalled();
+    await request(appFor(actor)).get(`${base}/${id}/${endpoint}`).expect(403);
+    expect(read()).not.toHaveBeenCalled();
   });
   it("allows a viewer read with no-store and exact company/intake scope", async () => {
     const viewer = { ...board, memberships: [{ companyId: company, status: "active", membershipRole: "viewer" }] };
-    const result = await request(appFor(viewer)).get(`${base}/${id}/preparation-status`).expect(200);
+    const result = await request(appFor(viewer)).get(`${base}/${id}/${endpoint}`).expect(200);
     expect(result.headers["cache-control"]).toBe("no-store");
-    expect(svc.preparationStatus).toHaveBeenCalledWith(company, id);
+    expect(read()).toHaveBeenCalledWith(company, id);
     expect(svc.create).not.toHaveBeenCalled(); expect(binding.bind).not.toHaveBeenCalled();
   });
   it("rejects caller-supplied verdicts and malformed IDs", async () => {
-    await request(appFor(board)).get(`${base}/${id}/preparation-status?approved=true`).expect(400);
-    await request(appFor(board)).get(`${base}/bad/preparation-status`).expect(400);
-    expect(svc.preparationStatus).not.toHaveBeenCalled();
+    await request(appFor(board)).get(`${base}/${id}/${endpoint}?approved=true`).expect(400);
+    await request(appFor(board)).get(`${base}/bad/${endpoint}`).expect(400);
+    expect(read()).not.toHaveBeenCalled();
   });
   it.each([404, 409, 503])("preserves a failed diagnostic as HTTP %i", async status => {
-    svc.preparationStatus.mockRejectedValue(new HttpError(status, "Unavailable"));
-    await request(appFor(board)).get(`${base}/${id}/preparation-status`).expect(status);
+    read().mockRejectedValue(new HttpError(status, "Unavailable"));
+    await request(appFor(board)).get(`${base}/${id}/${endpoint}`).expect(status);
   });
 });
 describe("OnisAll route authority (injected actor fixtures, not login proof)", () => {
