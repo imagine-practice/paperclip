@@ -19,6 +19,11 @@ describe("local disk storage provider", () => {
   const tempRoots: string[] = [];
 
   afterEach(async () => {
+    for (const root of tempRoots) {
+      if (path.dirname(path.resolve(root)) !== path.resolve(os.tmpdir()) || !path.basename(root).startsWith("paperclip-storage-")) {
+        throw new Error("Unexpected storage fixture cleanup path");
+      }
+    }
     await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
     tempRoots.length = 0;
   });
@@ -83,6 +88,23 @@ describe("local disk storage provider", () => {
 
     expect(fetchedBody.toString("utf8")).toBe("2345");
     expect(fetched.contentLength).toBe(4);
+  });
+
+  it("retains an existing explicit object when a later upload fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-storage-"));
+    tempRoots.push(root);
+    const service = createStorageService(createLocalDiskStorageProvider(root));
+    const bytes = Buffer.from("already committed input");
+    const input = { companyId: "company-1", namespace: "input", objectKey: "company-1/fixed.txt",
+      originalFilename: "input.txt", contentType: "text/plain" };
+    await service.putFile({ ...input, body: bytes });
+    const body = Readable.from((async function* () {
+      yield Buffer.from("partial"); throw new Error("source failed");
+    })());
+    await expect(service.putFile({ ...input, body, byteSize: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex") })).rejects.toThrow("source failed");
+    expect(await readStreamToBuffer((await service.getObject("company-1", input.objectKey)).stream)).toEqual(bytes);
+    expect(await fs.readdir(path.join(root, "company-1"))).toEqual(["fixed.txt"]);
   });
 
   it("blocks cross-company object access", async () => {

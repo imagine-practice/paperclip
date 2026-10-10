@@ -109,7 +109,9 @@ export function createStorageService(provider: StorageProvider): StorageService 
           contentLength: byteSize,
         });
       } catch (error) {
-        await provider.deleteObject({ objectKey }).catch(() => {});
+        // An explicit key may already belong to another successful request.
+        // Only this call's newly allocated random key is safe to clean up here.
+        if (input.objectKey === undefined) await provider.deleteObject({ objectKey }).catch(() => {});
         throw error;
       } finally {
         if (input.body instanceof Readable) input.body.destroy();
