@@ -217,6 +217,18 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
+  packages/adapters/commandcode-local:
+    devDependencies:
+      '@paperclipai/adapter-utils':
+        specifier: workspace:*
+        version: link:../../adapter-utils
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
   packages/adapters/cursor-cloud:
     dependencies:
       '@cursor/sdk':
