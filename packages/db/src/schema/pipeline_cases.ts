@@ -9,6 +9,7 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  unique,
   uuid,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
@@ -71,6 +72,7 @@ export const pipelineCases = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    onisallCaseScopeUq: unique("pipeline_cases_onisall_scope_uq").on(table.companyId, table.pipelineId, table.id),
     pipelineCaseKeyUq: uniqueIndex("pipeline_cases_pipeline_case_key_uq").on(table.pipelineId, table.caseKey),
     parentRequestKeyUq: uniqueIndex("pipeline_cases_parent_request_key_uq")
       .on(table.parentCaseId, table.requestKey)

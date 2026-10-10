@@ -4,6 +4,8 @@ import { companies, onisallInputSnapshots as snapshots, onisallIntakeDrafts as d
 import { createOnisallIntakeDraftSchema, observeOnisallInputSchema,
   type CreateOnisallIntakeDraft, type ObserveOnisallInput, type OnisallIntakeDraft,
   type OnisallInputSnapshot, type OnisallInputObservation } from "@paperclipai/shared";
+import { readIntakeBinding, bindingView } from "./binding-view.js";
+import type { AuthorizationActor } from "../authorization.js";
 import type { StorageService } from "../../storage/types.js";
 import { conflict, notFound, unprocessable } from "../../errors.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
@@ -17,11 +19,14 @@ function snapshotView(row: Snapshot): OnisallInputSnapshot {
   return { id: row.id, companyId: row.companyId, protocol: "onisall.input-text.v1", sha256: row.sha256,
     byteSize: row.byteSize, lineCount: row.lineCount, hasBom: row.hasBom, createdAt: row.createdAt.toISOString() };
 }
-function draftView(row: Draft, snapshot: Snapshot): OnisallIntakeDraft {
-  return { kind: "intake_draft", draftVersion: 1, id: row.id, companyId: row.companyId,
+async function draftView(conn: Db | Tx, row: Draft, snapshot: Snapshot, actor?: AuthorizationActor): Promise<OnisallIntakeDraft> {
+  const binding = await readIntakeBinding(conn, row.companyId, row.id, actor);
+  if (row.bindingStatus !== (binding ? "bound" : "binding_pending")) throw conflict("Intake binding projection differs");
+  return { kind: "intake_draft", draftVersion: 2, id: row.id, companyId: row.companyId,
     businessKey: row.businessKey, goal: row.goal, sourceLabel: row.sourceLabel,
-    status: "draft", bindingStatus: "binding_pending", controlMode: "native_pipeline",
-    clientId: null, projectId: null, caseId: null, contractId: null,
+    status: "draft", bindingStatus: binding ? "bound" : "binding_pending", controlMode: "native_pipeline",
+    clientId: null, projectId: binding?.projectId ?? null, caseId: binding?.caseId ?? null,
+    binding: binding ? bindingView(binding) : null, contractId: null,
     initialSnapshot: snapshotView(snapshot), createdAt: row.createdAt.toISOString() };
 }
 function observationView(row: typeof observations.$inferSelect): OnisallInputObservation {
@@ -42,16 +47,18 @@ function decode(content: string) {
 
 // Routes authenticate board/company membership. No Agent grants or native work
 // are created here. All database writes, including audit, share one transaction.
-export function onisallIntakeDraftService(db: Db, storage: StorageService) {
+export function onisallIntakeDraftService(db: Db, storage: StorageService, actor?: AuthorizationActor) {
   async function activeCompany(conn: Db | Tx, companyId: string, lock = false) {
     const query = conn.select().from(companies).where(eq(companies.id, companyId));
     const [company] = await (lock ? query.for("share") : query);
     if (!company) throw notFound("Company not found");
     if (company.status !== "active") throw conflict("Company is not active");
   }
-  async function findDraft(conn: Db | Tx, companyId: string, id: string) {
-    const [row] = await conn.select().from(drafts).where(scope(companyId, id));
+  async function findDraft(conn: Db | Tx, companyId: string, id: string, lock = false) {
+    const query = conn.select().from(drafts).where(scope(companyId, id));
+    const [row] = await (lock ? query.for("share") : query);
     if (!row) throw notFound("Intake draft not found");
+    await readIntakeBinding(conn, companyId, id, actor);
     return row;
   }
   async function findSnapshot(conn: Db | Tx, companyId: string, id: string) {
@@ -93,7 +100,12 @@ export function onisallIntakeDraftService(db: Db, storage: StorageService) {
         if (existing.requestHash !== requestHash) throw conflict("Request key already names different input");
         const snapshot = await findSnapshot(db, companyId, existing.initialSnapshotId);
         await readVerified(snapshot);
-        return { draft: draftView(existing, snapshot), replayed: true };
+        const view = await db.transaction(async tx => {
+          await activeCompany(tx, companyId, true);
+          const current = await findDraft(tx, companyId, existing.id, true);
+          return draftView(tx, current, snapshot, actor);
+        });
+        return { draft: view, replayed: true };
       }
       const result = await db.transaction(async (tx) => {
         await activeCompany(tx, companyId, true);
@@ -120,18 +132,20 @@ export function onisallIntakeDraftService(db: Db, storage: StorageService) {
           .onConflictDoNothing({ target: [drafts.companyId, drafts.businessKey] }).returning();
         const row = created ?? (await tx.select().from(drafts).where(and(eq(drafts.companyId, companyId), eq(drafts.businessKey, businessKey))))[0];
         if (!row || row.requestHash !== requestHash) throw conflict("Request key already names different input");
-        if (!created) return { draft: draftView(row, snapshot), replayed: true, publication: null };
+        if (!created) return { draft: await draftView(tx, await findDraft(tx, companyId, row.id, true), snapshot, actor), replayed: true, publication: null };
         await tx.insert(observations).values({ companyId, intakeId: row.id, snapshotId: snapshot.id,
           requestKey: data.requestKey, observedByUserId: actorId });
-        return { draft: draftView(row, snapshot), replayed: false,
+        return { draft: await draftView(tx, row, snapshot, actor), replayed: false,
           publication: await audit(tx, companyId, actorId, "onisall.intake_draft.created", row.id, snapshot.id) };
       });
       if (result.publication) publishActivity(result.publication);
       return { draft: result.draft, replayed: result.replayed };
     },
     async get(companyId: string, id: string) {
-      const row = await findDraft(db, companyId, id);
-      return draftView(row, await findSnapshot(db, companyId, row.initialSnapshotId));
+      return db.transaction(async tx => {
+        const row = await findDraft(tx, companyId, id, true);
+        return draftView(tx, row, await findSnapshot(tx, companyId, row.initialSnapshotId), actor);
+      });
     },
     async content(companyId: string, id: string) {
       const row = await findDraft(db, companyId, id);

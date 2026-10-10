@@ -5,6 +5,7 @@ import { alias, PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  onisallNativeBindings,
   documents,
   documentRevisions,
   heartbeatRuns,
@@ -2149,6 +2150,12 @@ function pipelineBatchError(error: unknown, fallbackCode = "unknown") {
   };
 }
 
+async function assertOnisallExecutionAdmission(db: PipelineDb, companyId: string, caseId: string) {
+  const [binding] = await db.select({ id: onisallNativeBindings.id }).from(onisallNativeBindings)
+    .where(and(eq(onisallNativeBindings.companyId, companyId), eq(onisallNativeBindings.caseId, caseId))).limit(1);
+  if (binding) throw conflict("OnisAll preparation binding has no execution grant", { code: "onisall_execution_not_granted" });
+}
+
 async function enqueueStageAutomationLedger(
   db: PipelineDb,
   input: {
@@ -2162,6 +2169,7 @@ async function enqueueStageAutomationLedger(
 ) {
   const automation = stageAutomation(input.stage);
   if (!automation) return null;
+  await assertOnisallExecutionAdmission(db, input.companyId, input.caseId);
   const [ledger] = await db
     .insert(pipelineAutomationExecutions)
     .values({
@@ -3111,6 +3119,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!execution) throw notFound("Pipeline automation execution not found");
+    await assertOnisallExecutionAdmission(db, execution.companyId, execution.caseId);
     if (execution.status === "succeeded" && execution.executionIssueId) {
       return { status: "succeeded", execution };
     }
@@ -3647,7 +3656,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
   }
 
   async function commitCaseIngest<TRelated>(
-    input: PipelineCaseIngestInput,
+    input: PipelineCaseIngestInput | ((tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<PipelineCaseIngestInput>),
     persistRelated: (
       tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
       ingest: Awaited<ReturnType<typeof ingestPipelineCaseInTransaction>>,
@@ -3657,7 +3666,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       throw conflict("Case ingest dispatch requires the root database", { code: "root_database_required" });
     }
     const { result, related } = await db.transaction(async (tx) => {
-      const result = await ingestPipelineCaseInTransaction(tx, input);
+      const preparedInput = typeof input === "function" ? await input(tx) : input;
+      const result = await ingestPipelineCaseInTransaction(tx, preparedInput);
       const related = await persistRelated(tx, result);
       return { result, related };
     });
@@ -4114,7 +4124,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
      * both creation and native replay. No network or execution side effects.
      */
     async ingestCaseWithRelatedRecords<TRelated>(
-      input: PipelineCaseIngestInput,
+      input: PipelineCaseIngestInput | ((tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<PipelineCaseIngestInput>),
       persistRelated: (
         tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
         ingest: Awaited<ReturnType<typeof ingestPipelineCaseInTransaction>>,

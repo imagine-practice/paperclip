@@ -11,6 +11,8 @@ import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { HttpError } from "../errors.js";
 
 const svc = vi.hoisted(() => ({ create: vi.fn(), get: vi.fn(), observe: vi.fn(), observations: vi.fn(), content: vi.fn() }));
+const binding = vi.hoisted(() => ({ context: vi.fn(), get: vi.fn(), bind: vi.fn() }));
+vi.mock("../services/onisall/native-bindings.js", () => ({ onisallNativeBindingService: () => binding }));
 vi.mock("../services/onisall/intake-drafts.js", () => ({ onisallIntakeDraftService: () => svc }));
 import { onisallIntakeRoutes } from "../routes/onisall-intakes.js";
 
@@ -33,6 +35,9 @@ function appFor(actor: unknown, chunks?: string[]) {
 beforeEach(() => {
   vi.resetAllMocks();
   svc.get.mockResolvedValue({ id });
+  binding.get.mockResolvedValue({ binding: null });
+  binding.bind.mockResolvedValue({ binding: { id }, replayed: false });
+  binding.context.mockResolvedValue({ intakeId: id });
   svc.create.mockResolvedValue({ draft: { id }, replayed: false });
   svc.observations.mockResolvedValue({ observations: [], nextOffset: null });
   svc.content.mockResolvedValue({ bytes: Buffer.from("a"), sha256: "a".repeat(64) });
@@ -84,5 +89,35 @@ describe("OnisAll HTTP input privacy", () => {
     const log = JSON.parse(output.trim());
     expect(log.reqBody).toBe("[REDACTED]"); expect(log.req.body).toBeUndefined();
     expect(log.reqParams).toBeUndefined(); expect(log.res.headers).toBeUndefined();
+  });
+});
+
+
+describe("OnisAll preparation binding routes", () => {
+  const input = { pipelineId: id, projectId: null, entryStageKey: "intake", inputSha256: "a".repeat(64), configurationHash: "b".repeat(64) };
+  it("validates the context and strict binding payload, and preserves replay status", async () => {
+    const app = appFor(board);
+    await request(app).get(`${base}/${id}/binding-context`).query({ pipelineId: id, entryStageKey: "intake" }).expect(200);
+    expect(binding.context).toHaveBeenCalledWith(company, id, { pipelineId: id, entryStageKey: "intake" });
+    await request(app).post(`${base}/${id}/binding`).send({ ...input, caseId: id }).expect(400);
+    expect(binding.bind).not.toHaveBeenCalled();
+    await request(app).post(`${base}/${id}/binding`).send(input).expect(201);
+    expect(binding.bind).toHaveBeenCalledWith(company, id, input);
+    binding.bind.mockResolvedValue({ binding: { id }, replayed: true });
+    await request(app).post(`${base}/${id}/binding`).send(input).expect(200);
+    await request(app).get(`${base}/${id}/binding`).expect(200);
+    await request(app).get(`${base}/${id}/binding-context`).query({ pipelineId: "bad", entryStageKey: "intake" }).expect(400);
+  });
+  it.each([{ type: "none" }, { type: "agent", companyId: company, agentId: id },
+    { ...board, source: "mcp_oauth" }, { ...board, companyIds: [] }])("denies untrusted binding access", async denied => {
+    await request(appFor(denied)).post(`${base}/${id}/binding`).send(input).expect(403);
+    await request(appFor(denied)).get(`${base}/${id}/binding`).expect(403);
+    expect(binding.bind).not.toHaveBeenCalled(); expect(binding.get).not.toHaveBeenCalled();
+  });
+  it("allows a viewer read while denying binding mutations", async () => {
+    const app = appFor({ ...board, memberships: [{ companyId: company, status: "active", membershipRole: "viewer" }] });
+    await request(app).get(`${base}/${id}/binding`).expect(200);
+    await request(app).post(`${base}/${id}/binding`).send(input).expect(403);
+    expect(binding.bind).not.toHaveBeenCalled();
   });
 });
