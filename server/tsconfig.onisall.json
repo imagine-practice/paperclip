@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["src/services/onisall/**/*.ts"],
+  "exclude": ["src/__tests__"]
+}

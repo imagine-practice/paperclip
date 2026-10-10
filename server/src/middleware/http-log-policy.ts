@@ -44,6 +44,13 @@ const SECRET_SENSITIVE_HTTP_PATHS = [
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
 
+/** Raw intake text and encoded source bytes stay out of HTTP diagnostics. */
+export function isPrivateOnisallInputHttpRequest(url: string | undefined): boolean {
+  if (!url) return false;
+  const pathname = normalizePath(url).replace(/^https?:\/\/[^/]*/i, "");
+  return /^\/api\/companies\/[^/]+\/onisall\/intakes(?:\/|$)/i.test(pathname);
+}
+
 /** Free-form agent feedback must never be copied into HTTP diagnostics. */
 export function isPrivateAgentCommentaryHttpRequest(url: string | undefined): boolean {
   if (!url) return false;
@@ -89,6 +96,7 @@ export function isSecretSensitiveHttpRequest(
   if (isPrivateWebhookHttpRequest(method, url)) return true;
   if (url && normalizePath(url).startsWith("/mcp/files/")) return true;
   if (isPrivateAgentCommentaryHttpRequest(url)) return true;
+  if (isPrivateOnisallInputHttpRequest(url)) return true;
   // Avatar uploads and dedicated Dot MCP calls may contain private image bytes.
   if (url && /^(?:\/mcp\/runner(?:\/|$)|\/api\/companies\/[^/]+\/agents\/[^/]+\/avatar(?:\/|$))/i.test(normalizePath(url).replace(/^https?:\/\/[^/]*/i, ""))) return true;
   if (!method || !url) return false;

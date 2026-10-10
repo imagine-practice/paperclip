@@ -38,6 +38,9 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  onisallInputObservations,
+  onisallIntakeDrafts,
+  onisallInputSnapshots,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
@@ -603,6 +606,9 @@ export function companyService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
         await tx.delete(documents).where(eq(documents.companyId, id));
         await tx.delete(issues).where(eq(issues.companyId, id));
+        await tx.delete(onisallInputObservations).where(eq(onisallInputObservations.companyId, id));
+        await tx.delete(onisallIntakeDrafts).where(eq(onisallIntakeDrafts.companyId, id));
+        await tx.delete(onisallInputSnapshots).where(eq(onisallInputSnapshots.companyId, id));
         await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
         await tx.delete(assets).where(eq(assets.companyId, id));
         await tx.delete(goals).where(eq(goals.companyId, id));
