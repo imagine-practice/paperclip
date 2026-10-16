@@ -185,7 +185,7 @@ const apps = [
     key: "email-agent", label: "Email with an agent", purpose: "channel", provider: "agentmail", transport: "rest_api", auth: "api_key", ownershipModes: ["customer"],
     whenToUse: "Assign an inbox to an agent and manage email conversations in tasks.", credentialFields: [{ key: "apiKey", label: "AgentMail API key", type: "password", placeholder: "am_…", required: true, secret: true }],
     guidanceMd: "Connect an AgentMail API key, then create or select an inbox for your agent. WebSocket receiving works without a public URL.",
-    consoleLinks: { keys: "https://console.agentmail.to", docs: "https://docs.agentmail.to/inboxes" }, riskTier: "S3", requiredResourceFilters: ["inbox"]
+    consoleLinks: { keys: "https://console.agentmail.to/dashboard/api-keys", docs: "https://docs.agentmail.to/inboxes" }, riskTier: "S3", requiredResourceFilters: ["inbox"]
   }],
   [
     "zapier",
@@ -783,7 +783,7 @@ const apps = [
       {
         serverUrl: "https://mcp.sentry.dev/mcp",
         discoveryUrl:
-          "https://sentry.io/.well-known/oauth-authorization-server",
+          "https://mcp.sentry.dev/.well-known/oauth-protected-resource/mcp",
       },
       "S2",
       "Connect the Sentry organization and projects agents need for incident work.",
@@ -1758,7 +1758,10 @@ for (const entry of researchManifest.entries) {
   }
   let methods = specialMethodsFor(entry);
   if (!methods) {
-    if (entry.authMode === "customer_oauth")
+    if (entry.authMode === "public")
+      methods = [method("public-mcp", "mcp_remote", "none", { serverUrl: entry.serverUrl }, entry.riskTier,
+        "Connect the provider's public MCP server without an account credential.", { label: "Connect public tools" })];
+    else if (entry.authMode === "customer_oauth")
       methods = [customerOAuthMethodFor(entry)];
     else if (entry.authMode === "api_key") methods = [apiKeyMethodFor(entry)];
     else {
@@ -1949,6 +1952,23 @@ for (const { slug, name, provider, subscription, envKey, url, description } of a
   // AI account flow; saved REST connections remain removable through Connections.
   app.methods = [...methods, ...app.methods.filter(method => method.transport !== "rest_api")];
 }
+// Reviewed provider-specific source data stays separate from generated output.
+// Apply it after legacy/research inputs, then run the same branding, permission,
+// instruction-template and validation pipeline as every other definition.
+const overridesDirectory = path.join(root, "scripts/app-definition-overrides");
+if (fs.existsSync(overridesDirectory)) {
+  for (const fileName of fs.readdirSync(overridesDirectory).filter(name => name.endsWith(".json")).sort()) {
+    const override = JSON.parse(fs.readFileSync(path.join(overridesDirectory, fileName), "utf8"));
+    if (!override.slug || fileName !== `${override.slug}.json` || !Array.isArray(override.methods)) {
+      throw new Error(`${fileName}: invalid provider definition source`);
+    }
+    override.branding = brandingFor(override.slug);
+    const existingIndex = apps.findIndex(app => app.slug === override.slug);
+    if (existingIndex === -1) apps.push(override);
+    else apps[existingIndex] = { ...apps[existingIndex], ...override };
+  }
+}
+
 // Every tool method has a checked-in permission review. Discovery metadata is
 // evidence for reviewers, never a runtime instruction to request more scopes.
 const permissionReviews = JSON.parse(fs.readFileSync(
@@ -2037,6 +2057,62 @@ const validateApp = (app) => {
         );
   }
 };
+apps.push({
+  "schemaVersion": 1,
+  "slug": "speko",
+  "name": "Speko",
+  "description": "Talk with a Paperclip agent through an experimental hosted voice connection.",
+  "categories": [
+    "communication"
+  ],
+  "featured": false,
+  "branding": {
+    "logoUrl": "/brands/apps/speko.svg"
+  },
+  "urlPatterns": [
+    "https://speko.ai/*",
+    "https://platform.speko.ai/*"
+  ],
+  "methods": [
+    {
+      "key": "voice-agent",
+      "label": "Talk with an agent",
+      "purpose": "channel",
+      "provider": "speko",
+      "transport": "voice",
+      "auth": "api_key",
+      "ownershipModes": [
+        "customer"
+      ],
+      "whenToUse": "Use browser voice to start and continue work with a selected Paperclip agent.",
+      "credentialFields": [
+        {
+          "key": "apiKey",
+          "label": "Speko API key",
+          "type": "password",
+          "required": true,
+          "placeholder": "Paste your Speko API key",
+          "secret": true
+        },
+        {
+          "key": "agentId",
+          "label": "Speko agent ID",
+          "type": "text",
+          "required": true,
+          "placeholder": "agent_\u2026",
+          "secret": false
+        }
+      ],
+      "guidanceMd": "Create a dedicated Speko voice persona and choose its voice. Paperclip registers signed session tools and keeps the selected Paperclip agent responsible for task work. Public HTTPS callbacks are required. Review provider recording settings; Speko charges are separate from agent costs. Phone calling is withheld pending live qualification.",
+      "consoleLinks": {
+        "register": "https://platform.speko.ai/agents",
+        "docs": "https://docs.speko.ai/guides/tool-calling"
+      },
+      "riskTier": "S3",
+      "requiredResourceFilters": []
+    }
+  ]
+});
 const captureFiles = definitionsOnly ? [] : fs
   .readdirSync(corpus)
   .filter((fileName) => fileName.endsWith(".md") && fileName !== "INDEX.md")

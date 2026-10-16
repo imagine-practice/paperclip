@@ -1,3 +1,4 @@
+import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
@@ -55,6 +56,7 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 import type {
   PluginEvent,
   ResourceLifecycleEvent,
+  ResourceLifecycleResult,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
@@ -712,6 +714,10 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  /** Optional total command execution budget, in milliseconds. A session
+   * provider must keep this distinct from individual observation timeouts.
+   * Zero disables this deadline. Absence keeps the existing session lifetime. */
+  commandTimeoutMs?: number;
   /**
    * Run this command outside the lease's persistent session.
    *
@@ -1345,6 +1351,8 @@ export interface HostToWorkerMethods {
   /** Scoped plugin API route dispatch. */
   handleApiRequest: [params: PluginApiRequestInput, result: PluginApiResponse];
   /** @see PLUGIN_SPEC.md §13.8 */
+  agentLifecycle: [params: AgentLifecycleRequest, result: AgentLifecycleResult];
+  resourceLifecycle: [params: ResourceLifecycleEvent, result: ResourceLifecycleResult];
   getData: [params: GetDataParams, result: unknown];
   /** @see PLUGIN_SPEC.md §13.9 */
   performAction: [params: PerformActionParams, result: unknown];
@@ -1481,6 +1489,8 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "runJob",
   "handleWebhook",
   "handleApiRequest",
+  "agentLifecycle",
+  "resourceLifecycle",
   "getData",
   "performAction",
   "executeTool",

@@ -1,3 +1,4 @@
+import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -267,6 +268,7 @@ export interface PreparedAdapterExecutionTargetRuntime {
   workspaceSyncSnapshot: {
     baseline: DirectorySnapshot;
     gitSnapshot: GitWorkspaceSnapshot | null;
+    repositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   } | null;
   cleanupWorkspaceSnapshot?(): Promise<void>;
   restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
@@ -278,6 +280,9 @@ export interface AdapterExecutionTargetProcessOptions {
   stdin?: string;
   timeoutSec: number;
   graceSec: number;
+  /** Sandbox-only: request the provider's persistent process session for a
+   * long-lived command. The host still gates this on provider capabilities. */
+  useSession?: boolean;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
@@ -881,6 +886,8 @@ export async function runAdapterExecutionTargetProcess(
         env,
         stdin: options.stdin,
         timeoutMs: options.timeoutSec > 0 ? options.timeoutSec * 1000 : target.timeoutMs ?? undefined,
+        ...(options.useSession !== undefined ? { useSession: options.useSession } : {}),
+        ...(options.useSession === true ? { commandTimeoutMs: Math.max(0, options.timeoutSec) * 1000 } : {}),
         // The tail loop already streams incremental chunks; suppress the
         // runner's end-of-run batched onLog to avoid duplicate log bytes.
         onLog: runLogTail ? undefined : options.onLog,
@@ -1428,13 +1435,20 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   workspaceLocalDir: string;
   timeoutSec?: number;
   workspaceRemoteDir?: string;
+  /** Sandbox transfer scratch, confined to the lease's reserved runtime tree. */
+  runtimeRootDir?: string;
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
+  workspaceSnapshotIsolation?: "worker";
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
+  workspaceCheckpoint?: boolean;
+  onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  workspaceSeedCacheDirectory?: string;
+  workspaceSeedCacheCompanyDirectory?: string;
   workspaceBaseline?: DirectorySnapshot;
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
+  workspaceRepositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   workspaceExclude?: string[];
-  /** Plain persistent directories include all files, independent of Git and task cache exclusions. */
   workspaceFileMode?: "all";
   preserveAbsentOnRestore?: string[];
   assets?: AdapterManagedRuntimeAsset[];
@@ -1454,6 +1468,11 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   // so the host pack time rides one `pack` span under the `stage.sync` step. The
   // SSH and local lanes ignore it. The default is a no-op.
   runtimeSpan?: RuntimeSpanRunner;
+  /**
+   * Sandbox copy-back retry delays. Environment probes restore into a throwaway
+   * temp workspace and pass `[]` so a failed restore does not stall the Test.
+   */
+  workspaceRestoreRetryDelaysMs?: readonly number[];
 }): Promise<PreparedAdapterExecutionTargetRuntime> {
   const target = input.target ?? { kind: "local" as const };
   if (target.kind === "local") {
@@ -1512,11 +1531,18 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     adapterKey: input.adapterKey,
     workspaceLocalDir: input.workspaceLocalDir,
     workspaceRemoteDir: input.workspaceRemoteDir,
+    runtimeRootDir: input.runtimeRootDir,
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
+    workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
     workspaceDurableSeed: input.workspaceDurableSeed,
+    workspaceCheckpoint: input.workspaceCheckpoint,
+    onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+    workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
+    workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
     workspaceBaseline: input.workspaceBaseline,
     workspaceGitSnapshot: input.workspaceGitSnapshot,
+    workspaceRepositories: input.workspaceRepositories,
     workspaceExclude: input.workspaceExclude,
     workspaceFileMode: input.workspaceFileMode,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
@@ -1527,6 +1553,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,
     runtimeSpan: input.runtimeSpan,
+    workspaceRestoreRetryDelaysMs: input.workspaceRestoreRetryDelaysMs,
   });
   return {
     target,
@@ -1553,11 +1580,13 @@ type GitHubLauncherLocation = {
   runId: string; target: AdapterExecutionTarget | null | undefined;
 };
 
-function githubOperationLauncherDirectory(input: GitHubLauncherLocation): string {
+/** Keep sandbox housekeeping within the producer-owned Runner runtime. */
+export function githubOperationLauncherDirectory(input: GitHubLauncherLocation): string {
   // Only controller-generated run IDs may name a removable directory.
   if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) throw new Error("Invalid GitHub launcher run ID");
   return input.target?.kind === "remote"
-    ? path.posix.join(input.target.remoteCwd, ".paperclip-runtime", "github", input.runId)
+    ? path.posix.join(input.target.remoteCwd, ".paperclip-runtime",
+        ...(input.target.transport === "sandbox" ? ["paperclip-runner"] : []), "github", input.runId)
     : path.join(os.tmpdir(), "paperclip-github-runtime", input.runId);
 }
 
@@ -1741,14 +1770,19 @@ export async function prepareGitHubOperationLaunchers(input: {
   ]);
   if (remote) {
     const runner = adapterExecutionTargetCommandRunner(remote);
-    for (const [program, body] of Object.entries(files)) {
-      await syncRemoteTextFileWithHashSkip({
-        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
-        remotePath: path.posix.join(directory, program), body,
-        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
-        lockDir: path.posix.join(directory, `.${program}.lock`),
-        timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
-      });
+    const entries = Object.entries(files);
+    const width = runner.allowConcurrentSyncOperations === true ? 3 : 1;
+    for (let offset = 0; offset < entries.length; offset += width) {
+      const results = await Promise.allSettled(entries.slice(offset, offset + width).map(([program, body]) =>
+        syncRemoteTextFileWithHashSkip({
+          runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
+          remotePath: path.posix.join(directory, program), body,
+          label: "GitHub operation launcher", action: "stage GitHub operation launcher",
+          lockDir: path.posix.join(directory, `.${program}.lock`),
+          timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
+        })));
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     }
     const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
     if (permissions.exitCode !== 0) throw new Error("Could not prepare managed GitHub launchers");

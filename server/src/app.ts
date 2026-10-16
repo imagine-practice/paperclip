@@ -1,14 +1,28 @@
+import { voiceSessionRoutes, voiceWebhookRoutes } from "./routes/voice-sessions.js";
+import { eq } from "drizzle-orm";
+import { chatEndpoints } from "@paperclipai/db";
+import { fastResponseRoutes } from "./routes/fast-responses.js";
+import { fastResponseService } from "./services/fast-responses.js";
+import { createDeliveryWorkCoordinator } from "./services/delivery-work-coordinator.js";
+import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
+import { createLifecycleDriver } from "./services/agent-lifecycle-driver.js";
+import { startAgentLifecycle } from "./services/agent-lifecycle.js";
 import { idleAdmissionMiddleware, trackIdleRequestHandlers } from "./middleware/idle-admission.js";
 import { isIdleTaskDrainActive, trackIdleWork } from "./services/task-admission.js";
 import { customerSuccessRoutes } from "./routes/customer-success.js";
 import { cloudWarmStandbyMiddleware } from "./middleware/cloud-warm-standby.js";
 import type { CloudWarmStandby } from "./services/cloud-warm-standby.js";
 import { browserUseRoutes } from "./routes/browser-use.js";
+import { registerChatActionWork } from "./services/chat-action-work.js";
+import { registerChatDeliveryWork } from "./services/chat-delivery-work.js";
+import { registerBrowserUseCleanup } from "./services/browser-use-work.js";
 import { browserUseService } from "./services/browser-use.js";
 import { slackToolRoutes } from "./routes/slack-tools.js";
 import { createPublicMcpOAuth, publicMcpConfig } from "./services/public-mcp/oauth.js";
-import { createDotRunnerMcpTools } from "./services/dot-runner-broker.js";
+import { createDotRunnerMcpTools, dotRunnerBroker } from "./services/dot-runner-broker.js";
 import { agentProfileAvatarRoutes } from "./routes/agent-profile-avatar.js";
+import { grokBotRoutes } from "./routes/grok-bot.js";
+import { createGrokRoutineDispatcher } from "./services/grok-bot/dispatcher.js";
 import { dotRunnerRoutes } from "./routes/dot-runner.js";
 import { createPublicMcpTransfers } from "./services/public-mcp/file-transfers.js";
 import { createMcpApiDispatch, createPublicMcpExecutor } from "./services/public-mcp/capabilities.js";
@@ -17,6 +31,7 @@ import { publicMcpIngressRoutes, publicMcpManagementRoutes } from "./routes/publ
 import { agentAvatarRoutes } from "./routes/agent-avatars.js";
 import { decisionModelRoutes } from "./routes/decision-models.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
+import { taskWorkspaceRoutes } from "./routes/task-workspaces.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
@@ -39,6 +54,7 @@ import {
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
+import { skillAccessRequestContext } from "./services/skill-access.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
@@ -56,6 +72,7 @@ import {
 } from "./services/company-import-transfers.js";
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
+import { livenessRoutes } from "./routes/liveness.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudControlMiddleware } from "./middleware/cloud-control.js";
 import { cloudRoutes } from "./routes/cloud.js";
@@ -69,6 +86,7 @@ import { summarySlotRoutes } from "./routes/summary-slots.js";
 import { statusCardRoutes } from "./routes/status-cards.js";
 import { teamsCatalogRoutes } from "./routes/teams-catalog.js";
 import { agentRoutes } from "./routes/agents.js";
+import { resolveAgentRunnerTargetForCompany } from "./services/agent-runner-selection.js";
 import type { SetupTokenSessionService } from "./services/setup-token-session.js";
 import {
   buildSetupTokenLoginTransport,
@@ -179,6 +197,7 @@ import {
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { heartbeatService } from "./services/heartbeat.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
+import { registerPluginLifecycleDelivery } from "./services/plugin-lifecycle-delivery.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import {
   buildHostServices,
@@ -315,8 +334,8 @@ export function createChatReconciliationCoordinator(input: {
   processFailedGitHubWebhookDeliveries?: () => Promise<unknown>;
   projectRunMilestones: () => Promise<number>;
   flushPublications: () => Promise<unknown>;
-  processPendingSlackFileUploadReceipts: () => Promise<unknown>;
-  processPendingSlackSessionSyncs: () => Promise<unknown>;
+  processPendingSlackFileUploadReceipts?: () => Promise<unknown>;
+  processPendingSlackSessionSyncs?: () => Promise<unknown>;
   onError: (lane: ChatReconciliationLane, error: unknown) => void;
 }) {
   let stopped = false;
@@ -362,8 +381,8 @@ export function createChatReconciliationCoordinator(input: {
       }
       milestoneReconciliation.poll();
       publicationReconciliation.poll();
-      start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
-      start("Slack session status", input.processPendingSlackSessionSyncs);
+      if (input.processPendingSlackFileUploadReceipts) start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
+      if (input.processPendingSlackSessionSyncs) start("Slack session status", input.processPendingSlackSessionSyncs);
     },
     notifyPublications() {
       milestoneReconciliation.notify();
@@ -485,11 +504,13 @@ export async function createApp(
     serverPort: number;
     storageService: StorageService;
     feedbackExportService?: {
+      hasPendingFeedbackTraces(): Promise<boolean>;
       flushPendingFeedbackTraces(input?: {
         companyId?: string;
         traceId?: string;
         limit?: number;
         now?: Date;
+        signal?: AbortSignal;
       }): Promise<unknown>;
     };
     databaseBackupService?: InstanceDatabaseBackupService;
@@ -568,7 +589,7 @@ export async function createApp(
   );
   const jsonBodyParser = express.json({ limit: DEFAULT_JSON_BODY_LIMIT, verify: captureRawBody });
   // File tickets authenticate before parsing bytes; JSON attachments must remain bytes too.
-  app.use((req, res, next) => req.path === "/mcp/files/upload" ? next() : jsonBodyParser(req, res, next));
+  app.use((req, res, next) => ["/mcp/files/upload", "/mcp/runner/files/upload"].includes(req.path) ? next() : jsonBodyParser(req, res, next));
   app.use("/api", apiCompression());
   app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
@@ -593,6 +614,9 @@ export async function createApp(
   const publicMcpIngress = Router();
 
   app.use(cloudRuntimeIdentityMiddleware(db));
+  // Routine probes stop before session/actor resolution, even after claim.
+  // Keep hostname validation and the signed-bootstrap endpoint guard above.
+  app.use("/api/liveness", livenessRoutes());
   // A signed claim above commits identity before any normal request can seed
   // company data. Unclaimed probes bypass session resolution as well as SQL.
   app.use(cloudWarmStandbyMiddleware(isWarmStandby, health, staticUi));
@@ -602,6 +626,31 @@ export async function createApp(
   // must be reachable by remote adapters that intentionally do not receive an
   // agent API key. Every request revalidates the active heartbeat row.
   app.use(runtimeConnectionIntentRoutes(db));
+  const hostServicesDisposers = new Map<string, () => void>();
+  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
+  let lifecyclePluginsReady = false;
+  const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
+  const connectionIntentHeartbeat = heartbeatService(db, {
+    pluginWorkerManager: workerManager,
+  });
+  const chatChannels = chatChannelService(db, {
+    allowLocalVoiceBoard: opts.deploymentMode === "local_trusted",
+    deferWebhookProcessing: true,
+    heartbeat: connectionIntentHeartbeat,
+    publicBaseUrl: opts.authPublicBaseUrl,
+    githubWizardOrigin: opts.deploymentMode === "local_trusted"
+      && ["127.0.0.1", "localhost", "::1"].includes(opts.bindHost ?? "")
+      && Number.isInteger(opts.serverPort) && opts.serverPort! > 0
+      ? `http://${opts.bindHost === "::1" ? "[::1]" : opts.bindHost}:${opts.serverPort}` : null,
+    webhookPublicBaseUrl: opts.chatWebhookPublicBaseUrl,
+    resolveNativeQuestion: (interaction) =>
+      deliverNativeQuestionResponse(db, interaction),
+    storage: opts.storageService,
+  });
+  // Voice capabilities are verified by the signed callback route, not by
+  // board/agent bearer authentication. Mount before actorMiddleware so its
+  // per-session Bearer cannot be mistaken for an agent API key.
+  app.use(voiceWebhookRoutes(db, chatChannels.voice));
   app.use(
     actorMiddleware(db, {
       deploymentMode: opts.deploymentMode,
@@ -612,44 +661,53 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  app.use(skillAccessRequestContext);
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
   app.use(llmRoutes(db));
 
-  const hostServicesDisposers = new Map<string, () => void>();
-  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
-  const connectionIntentHeartbeat = heartbeatService(db, {
-    pluginWorkerManager: workerManager,
-  });
-  const chatChannels = chatChannelService(db, {
-    deferWebhookProcessing: true,
-    heartbeat: connectionIntentHeartbeat,
-    publicBaseUrl: opts.authPublicBaseUrl,
-    webhookPublicBaseUrl: opts.chatWebhookPublicBaseUrl,
-    resolveNativeQuestion: (interaction) =>
-      deliverNativeQuestionResponse(db, interaction),
-    storage: opts.storageService,
-  });
   // Provider-authenticated ingress is intentionally outside the board
   // mutation guard. The Chat SDK adapter verifies the provider signature
   // before Paperclip persists or acts on any event.
   const emailChannels = emailChannelService(db, {
+    isReconciliationEnabled: () => !isWarmStandby(),
     isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive(),
     heartbeat: connectionIntentHeartbeat,
     storage: opts.storageService,
     publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl,
   });
   app.use(emailWebhookRoutes(emailChannels));
+  app.locals.fastResponses = fastResponseService(db, {
+    authorizeExternal: async (tx, request) => {
+      const [endpoint] = await tx.select({ provider: chatEndpoints.provider }).from(chatEndpoints).where(eq(chatEndpoints.id, request.endpointId!));
+      return endpoint?.provider === "agentmail" ? emailChannels.authorizeFastResponse(tx, request) : chatChannels.authorizeFastResponse(tx, request);
+    },
+    publishExternal: async (tx, request, commentId, text) => {
+      const [endpoint] = await tx.select({ provider: chatEndpoints.provider }).from(chatEndpoints).where(eq(chatEndpoints.id, request.endpointId!));
+      if (endpoint?.provider !== "agentmail") return false;
+      await emailChannels.publishFastResponse(tx, request, commentId, text);
+      return true;
+    },
+    budgetHooks: { cancelWorkForScope: connectionIntentHeartbeat.cancelBudgetScopeWork },
+  });
   app.use(chatWebhookRoutes(chatChannels));
   // The instance validates single-use registration state and its trusted
-  // current origin. This exact GET is the only public setup return.
+  // current origin. These exact callback routes are the public setup returns.
   app.get("/api/chat-github/manifest/callback", async (req, res) => {
     res.set("Cache-Control", "no-store");
     res.set("Referrer-Policy", "no-referrer");
-    const redirect = await chatChannels.completeGitHubRegistration(String(req.query.state ?? ""), String(req.query.code ?? ""));
+    const redirect = await chatChannels.githubWizard.directCallback(String(req.query.state ?? ""), String(req.query.code ?? ""));
     res.redirect(303, redirect);
+  });
+  app.get("/api/chat-github/cloud/callback", async (req, res) => {
+    res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
+    res.redirect(303, await chatChannels.githubWizard.cloudCallback(String(req.query.state ?? ""), String(req.query.registration ?? ""), typeof req.query.claim === "string" ? req.query.claim : undefined));
+  });
+  app.get("/api/chat-github/identity/callback", async (req, res) => {
+    res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
+    res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? "")));
   });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
@@ -789,6 +847,7 @@ export async function createApp(
   api.use(onisallSchemaSetRoutes(db));
   api.use(agentProfileAvatarRoutes(db, opts.storageService));
   api.use(projectToolRoutes(db));
+  api.use(taskWorkspaceRoutes(db));
   api.use(projectRoutes(db));
   api.use(caseRoutes(db, opts.storageService));
   api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
@@ -811,6 +870,7 @@ export async function createApp(
   api.use(goalRoutes(db));
   api.use(onboardingSeedRoutes(db));
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
+  api.use(voiceSessionRoutes(db, chatChannels.voice));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(secretRoutes(db));
   api.use(managedAgentProfileRoutes(db));
@@ -881,7 +941,6 @@ export async function createApp(
   // route prefixes, so this dependency does not change issue-route precedence.
   api.use(issueRoutes(db, opts.storageService, {
     chatRunRetries: chatChannels,
-    feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
     declineToolActionRequest: (input) => toolGateway.declineActionRequest(input),
@@ -892,6 +951,7 @@ export async function createApp(
   app.locals.toolActionDeliveries = toolActionDeliveries;
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(decisionModelRoutes(db));
+  api.use(fastResponseRoutes(db));
   api.use(aiConnectionRoutes(db, { deploymentMode: opts.deploymentMode, deploymentExposure: opts.deploymentExposure, trustedLocalStdioRuntimeHost }));
   api.use(
     toolAccessRoutes(db, {
@@ -988,6 +1048,7 @@ export async function createApp(
   );
   api.use(
     adapterRoutes({
+      resolveRunnerTarget: (companyId, environmentId) => resolveAgentRunnerTargetForCompany(db, companyId, environmentId),
       getNativeRunnerEnabled: async () =>
         (await instanceSettingsService(db).getExperimental())
           .enableNativeRunner === true,
@@ -1006,9 +1067,10 @@ export async function createApp(
     }),
   );
   let publicMcpEvents: PublicMcpEvents | null = null;
+  const grokDispatcher = createGrokRoutineDispatcher(db, () => !isWarmStandby() && !isIdleTaskDrainActive());
   let dotMcpEvents: PublicMcpEvents | null = null;
   if (publicMcpOAuth) {
-    const dispatch = createMcpApiDispatch(api);
+    const dispatch = createMcpApiDispatch(api, app.locals);
     publicMcpEvents = createPublicMcpEvents(db, publicMcpOAuth, dispatch, {
       isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive(),
     });
@@ -1019,9 +1081,14 @@ export async function createApp(
     const dotOAuth = createPublicMcpOAuth(db, { ...publicMcpOAuth.config, resource: publicMcpOAuth.config.origin + "/mcp/runner" });
     dotMcpEvents = createPublicMcpEvents(db, dotOAuth, dispatch, { enableDotRunner: true, isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive() });
     dotMcpEvents.start();
-    publicMcpIngress.use(publicMcpIngressRoutes(dotOAuth, createPublicMcpExecutor(db, dotOAuth, dispatch), dotMcpEvents, createDotRunnerMcpTools(db)));
+    const grokTransfers = createPublicMcpTransfers(db, dotOAuth, dispatch, opts.storageService, { pathPrefix: "/mcp/runner/files",
+      agentSession: { authorize: (principal, sessionId, taskId, write, database) => dotRunnerBroker(database ?? db).authorizeFileSession(principal, sessionId, taskId, write) } });
+    publicMcpIngress.use(grokTransfers.router);
+    publicMcpIngress.use(publicMcpIngressRoutes(dotOAuth, createPublicMcpExecutor(db, dotOAuth, dispatch), dotMcpEvents, createDotRunnerMcpTools(db, connectionIntentHeartbeat, grokTransfers)));
     api.use(publicMcpManagementRoutes(publicMcpOAuth, dotOAuth));
     api.use(dotRunnerRoutes(db, publicMcpOAuth.config.origin + "/mcp/runner"));
+    api.use(grokBotRoutes(db, publicMcpOAuth.config.origin + "/mcp/runner"));
+    grokDispatcher.start();
   }
 
   app.use("/api", api);
@@ -1194,59 +1261,42 @@ export async function createApp(
 
   jobCoordinator.start();
   scheduler.start();
-  let feedbackExportShuttingDown = false;
-  let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
-  const disableFeedbackExportFlushes = () => {
-    feedbackExportShuttingDown = true;
-    if (feedbackExportTimer) {
-      clearInterval(feedbackExportTimer);
-      feedbackExportTimer = null;
-    }
-  };
-  const flushPendingFeedbackExports = async () => {
-    if (feedbackExportShuttingDown || isWarmStandby() || isIdleTaskDrainActive()) return;
-    try {
-      await opts.feedbackExportService?.flushPendingFeedbackTraces();
-    } catch (err) {
-      if (isDatabaseConnectionUnavailableError(err)) {
-        disableFeedbackExportFlushes();
-        logger.warn(
-          { err },
-          "Disabling pending feedback export flushes because the database is unavailable",
-        );
-        return;
-      }
-      logger.error({ err }, "Failed to flush pending feedback exports");
-    }
-  };
-
-  feedbackExportTimer = opts.feedbackExportService
-    ? setInterval(() => {
-        void flushPendingFeedbackExports();
-      }, FEEDBACK_EXPORT_FLUSH_INTERVAL_MS)
-    : null;
-  feedbackExportTimer?.unref?.();
+  const deliveryWork = createDeliveryWorkCoordinator({
+    owner: db,
+    canRun: () => !isWarmStandby() && !isIdleTaskDrainActive(),
+    canReconcile: () => !isWarmStandby(),
+    onError: (err, queue) => logger.error({ err, queue }, "Delivery reconciliation failed"),
+  });
+  app.locals.deliveryWork = deliveryWork;
+  const resourceLifecycleDelivery = registerPluginLifecycleDelivery(deliveryWork, db, workerManager, lifecycle);
   if (opts.feedbackExportService) {
-    void flushPendingFeedbackExports();
+    deliveryWork.register(DELIVERY_QUEUES.feedback, {
+      retryMs: FEEDBACK_EXPORT_FLUSH_INTERVAL_MS,
+      run: (signal) => opts.feedbackExportService!.flushPendingFeedbackTraces({ signal }),
+      hasPending: () => opts.feedbackExportService!.hasPendingFeedbackTraces(),
+    });
   }
+  registerChatDeliveryWork(deliveryWork, chatChannels, () => !isIdleTaskDrainActive());
+  registerChatActionWork(deliveryWork, chatChannels, () => !isIdleTaskDrainActive());
   emailChannels.start();
-  const flushChatPublications = async () => {
-    await chatChannels.schedulePendingPublications();
+  const reconcileChatPublicationMaintenance = async () => {
+    await chatChannels.processPublicationMaintenance();
   };
   const chatReconciliation = createChatReconciliationCoordinator({
-    reconcileProviderRuntimes: () => chatChannels.reconcileProviderRuntimes(),
-    processPendingDeliveries: () => chatChannels.processPendingDeliveries(),
+    reconcileProviderRuntimes: async () => {
+      await chatChannels.reconcileProviderRuntimes();
+      await chatChannels.voice.reconcile();
+    },
+    // Chat delivery, action, and Telegram discovery workers now own these
+    // duties. Keep the coordinator's other maintenance lanes independent.
+    processPendingDeliveries: async () => undefined,
     processFailedGitHubWebhookDeliveries: () =>
       chatChannels.processFailedGitHubWebhookDeliveries(),
     projectRunMilestones: () =>
       enqueueChatRunMilestones(db, {
         publicBaseUrl: opts.authPublicBaseUrl,
       }),
-    flushPublications: () => flushChatPublications(),
-    processPendingSlackFileUploadReceipts: () =>
-      chatChannels.processPendingSlackFileUploadReceipts(),
-    processPendingSlackSessionSyncs: () =>
-      chatChannels.processPendingSlackSessionSyncs(),
+    flushPublications: () => reconcileChatPublicationMaintenance(),
     onError: (lane, err) => {
       logger.error({ err, lane }, `Failed to reconcile chat ${lane}`);
     },
@@ -1257,6 +1307,8 @@ export async function createApp(
         chatReconciliation.notifyPublications();
     },
   );
+  // Provider/action maintenance and milestone projection still use this cadence.
+  // Inbox, outbox, and file receipt queues have independent commit/deadline wakes.
   let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
     () => {
       if (!isWarmStandby() && !isIdleTaskDrainActive()) chatReconciliation.reconcile();
@@ -1285,12 +1337,7 @@ export async function createApp(
         );
       });
   };
-  const browserUseTimer = setInterval(() => {
-    if (isWarmStandby() || isIdleTaskDrainActive()) return;
-    void browserUse.sweep().catch(() => logger.warn("Browser Use reconciliation failed; retrying."));
-  }, 3000);
-  browserUseTimer.unref?.();
-  if (!isWarmStandby() && !isIdleTaskDrainActive()) void browserUse.sweep().catch(() => logger.warn("Browser Use startup reconciliation failed; retrying."));
+  registerBrowserUseCleanup(deliveryWork, browserUse, () => !isIdleTaskDrainActive());
   let importTransferSweepTimer: ReturnType<typeof setInterval> | null =
     setInterval(
       sweepImportTransferSpools,
@@ -1380,6 +1427,7 @@ export async function createApp(
       logger.error({ err }, "Failed to load ready plugins on startup");
     });
   app.locals.bundledPluginsStartup = trackIdleWork(bundledPluginsStartup);
+  void bundledPluginsStartup.then(() => { lifecyclePluginsReady = true; resourceLifecycleDelivery.wake(); return agentLifecycle.sweep(); }).catch(() => logger.warn("Agent lifecycle recovery failed; retrying."));
   // The shutdown hook runs at most once. It caches the in-flight promise, so a
   // second caller (for example the `exit` handler) awaits the same completion
   // instead of starting a second teardown.
@@ -1390,10 +1438,12 @@ export async function createApp(
       // The scheduler tick queries the database. Stop it here, inside the
       // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
+      await agentLifecycle.stop();
       await publicMcpEvents?.stop();
-      await dotMcpEvents?.stop();
+      await dotMcpEvents?.stop(); grokDispatcher.stop();
       jobCoordinator.stop();
-      disableFeedbackExportFlushes();
+      resourceLifecycleDelivery.dispose();
+      await deliveryWork.stop();
       unsubscribeChatPublicationSignals();
       chatReconciliation.stop();
       if (chatPublicationTimer) {
@@ -1401,7 +1451,6 @@ export async function createApp(
         chatPublicationTimer = null;
       }
       await chatReconciliation.drain();
-      clearInterval(browserUseTimer);
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;

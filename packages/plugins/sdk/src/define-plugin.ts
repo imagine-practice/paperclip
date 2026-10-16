@@ -1,3 +1,4 @@
+import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * `definePlugin` — the top-level helper for authoring a Paperclip plugin.
@@ -50,7 +51,7 @@ import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paper
  * ```
  */
 
-import type { PluginContext } from "./types.js";
+import type { PluginContext, ResourceLifecycleEvent, ResourceLifecycleResult } from "./types.js";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -352,14 +353,30 @@ export interface PluginDefinition {
   ): Promise<DetectExternalObjectsResult>;
 
   /**
+   * Complete required work for the committed agent lifecycle phase.
+   * Requires manifest `agentLifecycle: true` and `agents.lifecycle.manage`.
+   * Echo operationId/version; return pending until the effect finishes.
+   * Calls can repeat. Fence older versions and make external effects idempotent.
+   */
+  onAgentLifecycle?(params: AgentLifecycleRequest): Promise<AgentLifecycleResult>;
+
+  /**
+   * Reconcile a committed resource event. Requires manifest resourceLifecycle and events.subscribe.
+   * The host acknowledges successful results and replays interrupted/unfinished work.
+   * Calls are at least once, in order per resource. Re-read current state and use
+   * idempotent external operations; deletion events remain available after the row is gone.
+   */
+  onResourceLifecycle?(event: ResourceLifecycleEvent): Promise<ResourceLifecycleResult>;
+
+  /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
+  onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;
+
+  /**
    * Called when Paperclip needs the current normalized status for one external
    * object owned by a manifest-declared provider.
    *
    * Requires `external.objects.read`.
    */
-  /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
-  onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;
-
   onResolveExternalObject?(
     params: ResolveExternalObjectParams,
   ): Promise<PluginExternalObjectResolveResult>;

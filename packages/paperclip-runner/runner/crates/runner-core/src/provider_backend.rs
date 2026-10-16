@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput,
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput, CodexTurnOptions,
     ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
     MAX_SETTLED_PROVIDER_TURN_IDS,
 };
@@ -2608,7 +2608,14 @@ impl CodexCommandExecutor {
             .as_ref()
             .and_then(|state| state.thread_id.as_ref())
             .is_some();
-        let (thread_id, provider_session_id, process_id, active_provider_turn_id, goal_probe) = {
+        let (
+            thread_id,
+            provider_session_id,
+            process_id,
+            active_provider_turn_id,
+            goal_probe,
+            observed_model,
+        ) = {
             let provider = self.ensure_provider()?;
             (
                 provider.thread_id().to_owned(),
@@ -2616,6 +2623,7 @@ impl CodexCommandExecutor {
                 provider.process_id(),
                 provider.active_provider_turn_id().map(str::to_owned),
                 provider.get_goal(),
+                provider.observed_model().map(str::to_owned),
             )
         };
         let (goal_capability, goal) = match goal_probe {
@@ -2703,6 +2711,7 @@ impl CodexCommandExecutor {
                         "providerSessionId": thread_id,
                         "providerAccountSessionId": provider_session_id,
                         "processId": process_id,
+                        "providerDescriptor": { "driver": driver, "providerVersion": provider_version, "effectiveModel": observed_model },
                     }),
                 ),
                 (
@@ -2903,7 +2912,24 @@ impl CodexCommandExecutor {
                 .validate()
                 .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         }
+        let reasoning_mode = match payload.get("reasoningMode") {
+            None => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "default" | "disabled") => {
+                Some(mode.as_str())
+            }
+            Some(_) => return Err(DurableRunnerError::invalid("invalid turn.reasoningMode")),
+        };
         self.restore_provider_if_needed()?;
+        if reasoning_mode.is_some()
+            && self
+                .state
+                .as_ref()
+                .is_none_or(|state| state.config.provider != "opencode")
+        {
+            return Err(DurableRunnerError::invalid(
+                "turn.reasoningMode requires OpenCode",
+            ));
+        }
         if self
             .state
             .as_ref()
@@ -2986,7 +3012,15 @@ impl CodexCommandExecutor {
             rejected_accepted_turn,
         ) = {
             let provider = self.ensure_provider()?;
-            let result = provider.start_turn_with_skills(text, &cwd, &skills);
+            let result = provider.start_turn_with_options_and_effort(
+                text,
+                &cwd,
+                CodexTurnOptions {
+                    skills: &skills,
+                    reasoning_mode,
+                },
+                payload.get("effort"),
+            );
             (
                 result,
                 provider.completed_turn_authority().is_some(),
@@ -3594,7 +3628,9 @@ impl CodexCommandExecutor {
         state.receipt_limit_interrupt_accepted = false;
         state.receipt_limit_interrupt_attempts = 0;
         state.receipt_limit_interrupt_deadline_unix_ms = None;
-        state.lifecycle = "provider_exited".to_owned();
+        // Deadline settlement retires this run permanently. Polling its terminal
+        // outbox must not reopen a provider that still reports the stopped turn.
+        state.lifecycle = "closed".to_owned();
         let terminal_event_type = if interrupt_accepted {
             "turn.interrupted"
         } else {
@@ -4972,6 +5008,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5353,6 +5390,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5444,6 +5482,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5497,6 +5536,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5540,6 +5580,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5632,6 +5673,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5699,6 +5741,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5749,6 +5792,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5873,6 +5917,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -5985,6 +6030,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -6042,6 +6088,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -6065,6 +6112,27 @@ mod tests {
         let mut executor = CodexCommandExecutor::new(PathBuf::from("unused-test-state"));
         executor.state = Some(state);
         executor.restore_checked = true;
+
+        for mode in [
+            json!(null),
+            json!(false),
+            json!("bad"),
+            json!("disabled"),
+            json!("default"),
+        ] {
+            let error = executor
+                .start_turn(&json!({"text": "must not reach the provider", "reasoningMode": mode}))
+                .unwrap_err();
+            assert!(error.to_string().contains("reasoningMode"));
+            assert!(executor.provider.is_none());
+            assert!(
+                !executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .ambiguous_turn_start_pending
+            );
+        }
 
         let error = executor
             .start_turn(&json!({"text": "must not reach the provider"}))
@@ -6163,6 +6231,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -6204,6 +6273,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -6242,6 +6312,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -6308,7 +6379,7 @@ mod tests {
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
-                command: PathBuf::from("codex"),
+                command: PathBuf::from("/definitely-missing-receipt-deadline-provider"),
                 args: vec!["app-server".to_owned()],
                 cwd: std::env::current_dir()
                     .unwrap()
@@ -6319,6 +6390,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
@@ -6355,7 +6427,7 @@ mod tests {
         executor.maintain_backpressured_provider().unwrap();
 
         let state = executor.state.as_ref().unwrap();
-        assert_eq!(state.lifecycle, "provider_exited");
+        assert_eq!(state.lifecycle, "closed");
         assert!(state.active_provider_turn_id.is_none());
         assert!(!state.receipt_limit_interrupt_pending);
         assert!(state.pending_events.iter().any(|event| {
@@ -6373,6 +6445,13 @@ mod tests {
             settled
         );
         assert!(executor.provider.is_none());
+        // Reading terminal evidence must not restart work whose interruption
+        // exhausted its deadline, even after a controller reconnects.
+        assert!(!executor.poll_events().unwrap().is_empty());
+        assert!(executor.provider.is_none());
+        let mut restarted = CodexCommandExecutor::new(&directory);
+        assert!(!restarted.poll_events().unwrap().is_empty());
+        assert!(restarted.provider.is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 }
