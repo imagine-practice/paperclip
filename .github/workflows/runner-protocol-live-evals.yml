@@ -45,7 +45,7 @@ concurrency:
 jobs:
   authorize:
     name: Authorize paid direct eval campaign
-    if: github.event_name != 'schedule' || vars.RUNNER_PROTOCOL_EVAL_NIGHTLY_ENABLED == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name != 'schedule' || vars.RUNNER_PROTOCOL_EVAL_NIGHTLY_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -409,6 +409,7 @@ jobs:
           if-no-files-found: error
 
   eval_shard_0:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     name: Direct eval ${{ matrix.rosterId }} / ${{ matrix.caseId }}
     needs: [authorize, catalog, build_runner]
     runs-on: ${{ needs.authorize.outputs.test_runner }}
@@ -637,7 +638,7 @@ jobs:
 
   eval_shard_1:
     name: Direct eval ${{ matrix.rosterId }} / ${{ matrix.caseId }}
-    if: needs.catalog.outputs.matrix_1_present == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (needs.catalog.outputs.matrix_1_present == 'true')
     needs: [authorize, catalog, build_runner]
     runs-on: ${{ needs.authorize.outputs.test_runner }}
     timeout-minutes: 18
@@ -842,7 +843,7 @@ jobs:
   publish_history:
     name: Publish immutable Evalbook and mutable campaign index
     needs: [authorize, catalog, report]
-    if: always() && needs.report.outputs.public_report_ready == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (always() && needs.report.outputs.public_report_ready == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:

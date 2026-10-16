@@ -55,7 +55,7 @@ concurrency:
 jobs:
   authorize:
     name: Authorize paid campaign
-    if: github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -361,6 +361,7 @@ jobs:
           echo "max_parallel=$MAX_PARALLEL" >> "$GITHUB_OUTPUT"
 
   daytona_image:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     name: Publish verified Daytona image
     needs: [authorize, target_lock, catalog]
     # Keep image builds on the same authorized fleet as campaign execution.
@@ -768,6 +769,7 @@ jobs:
           if-no-files-found: error
 
   test:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     name: ${{ matrix.executionId }}
     needs:
       [
@@ -1225,7 +1227,7 @@ jobs:
   publish_history:
     name: Publish S3 history and Pages bundle with declared screenshots
     needs: [authorize, catalog, report]
-    if: always() && needs.catalog.result == 'success' && needs.report.outputs.history_source_ready == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (always() && needs.catalog.result == 'success' && needs.report.outputs.history_source_ready == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -1302,7 +1304,7 @@ jobs:
   pages:
     name: Publish latest dashboard with declared screenshots
     needs: [report, publish_history]
-    if: always() && needs.report.outputs.history_source_ready == 'true' && needs.publish_history.result == 'success' && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (always() && needs.report.outputs.history_source_ready == 'true' && needs.publish_history.result == 'success' && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true')
     runs-on: ubuntu-latest
     permissions:
       pages: write
