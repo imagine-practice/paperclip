@@ -1,3 +1,4 @@
+import { assertMigrationInspectionConnection, assertMigrationWriteAllowed, closedStartupMigrationError, coreMigrationMode } from "./startup-migration-policy.js";
 import { createHash } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { readFile, readdir } from "node:fs/promises";
@@ -941,6 +942,7 @@ export type MigrationHistoryReconcileResult = {
 export async function reconcilePendingMigrationHistory(
   url: string,
 ): Promise<MigrationHistoryReconcileResult> {
+  assertMigrationWriteAllowed();
   const state = await inspectMigrations(url);
   if (state.status !== "needsMigrations" || state.reason !== "pending-migrations") {
     return { repairedMigrations: [], remainingMigrations: [] };
@@ -1053,6 +1055,16 @@ async function discoverMigrationTableSchema(sql: ReturnType<typeof postgres>): P
 }
 
 export async function inspectMigrations(url: string): Promise<MigrationState> {
+  assertMigrationInspectionConnection(url);
+  try {
+    return await inspectMigrationsUnchecked(url);
+  } catch (error) {
+    if (coreMigrationMode === "inspect_only") throw closedStartupMigrationError(error, "inspection_failed");
+    throw error;
+  }
+}
+
+async function inspectMigrationsUnchecked(url: string): Promise<MigrationState> {
   const sql = createUtilitySql(url);
 
   try {
@@ -1122,6 +1134,7 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
 }
 
 export async function applyPendingMigrations(url: string): Promise<void> {
+  assertMigrationWriteAllowed();
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
@@ -1171,6 +1184,7 @@ export type MigrationBootstrapResult =
   | { migrated: false; reason: "not-empty-no-migration-journal"; tableCount: number };
 
 export async function migratePostgresIfEmpty(url: string): Promise<MigrationBootstrapResult> {
+  assertMigrationWriteAllowed();
   const sql = createUtilitySql(url);
 
   try {
@@ -1205,6 +1219,7 @@ export async function ensurePostgresDatabase(
   url: string,
   databaseName: string,
 ): Promise<"created" | "exists"> {
+  assertMigrationWriteAllowed();
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(databaseName)) {
     throw new Error(`Unsafe database name: ${databaseName}`);
   }
@@ -1227,6 +1242,7 @@ export async function resetPostgresDatabase(
   url: string,
   databaseName: string,
 ): Promise<"reset"> {
+  assertMigrationWriteAllowed();
   const quotedDatabaseName = quoteIdentifier(databaseName);
   const sql = createUtilitySql(url);
   try {

@@ -1,3 +1,4 @@
+import { assertStartupMigrationEnvironment, coreMigrationMode } from "@paperclipai/db/startup-migration-policy";
 import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
@@ -32,27 +33,31 @@ import {
   resolveHomeAwarePath,
 } from "./home-paths.js";
 
-const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
-if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
-  loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
-}
+assertStartupMigrationEnvironment();
+if (coreMigrationMode === "legacy") {
+  const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
+  if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
+    loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+  }
 
-const CWD_ENV_PATH = resolve(process.cwd(), ".env");
-const cwdEnvExists = existsSync(CWD_ENV_PATH);
-const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
-  ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
-  : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
-if (shouldLoadWorkingDirectoryEnv({
-  cwdEnvExists,
-  isPaperclipEnvFile: isSameFile,
-})) {
-  loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
-}
+  const CWD_ENV_PATH = resolve(process.cwd(), ".env");
+  const cwdEnvExists = existsSync(CWD_ENV_PATH);
+  const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
+    ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
+    : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
+  if (shouldLoadWorkingDirectoryEnv({
+    cwdEnvExists,
+    isPaperclipEnvFile: isSameFile,
+  })) {
+    loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
+  }
 
-if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
-  applyEmptyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
+  assertStartupMigrationEnvironment();
+  if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
+    applyEmptyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
+  }
+  maybeRepairLegacyWorktreeConfigAndEnvFiles();
 }
-maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
 const TAILSCALE_DETECT_TIMEOUT_MS = 3000;
 

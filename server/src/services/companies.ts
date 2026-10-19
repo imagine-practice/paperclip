@@ -307,7 +307,6 @@ export function companyService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
-
         if (data.budgetMonthlyCents !== undefined) {
           await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, id)).for("no key update");
         }

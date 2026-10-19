@@ -40,14 +40,34 @@ import {
   type PipelineStageAutomation,
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
+  pipelineOperationTransitionRequestSchema,
+  type PipelineOperationTransitionRequest,
+  type PipelineOperationReceipt,
   type RoutineVariable,
-  type RoutineRevisionSnapshotV1,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { routineService } from "./routines.js";
+import { buildRoutineRevisionSnapshot } from "./routine-revision-snapshot.js";
+import {
+  updatePipelineConfigurationInTransaction,
+  replacePipelineTransitionsInTransaction,
+  publishPipelineConfigurationActivity,
+  type PipelineMetadataMutation,
+  type PipelineTransitionsMutation,
+} from "./pipeline-configuration.js";
+import { deletePipelineStageInTransaction, type PipelineStageDeletionInput } from "./pipeline-stage-deletion.js";
+import { attemptPipelineAutoAdvance } from "./pipeline-auto-advance.js";
+import { pipelineRelationScopeError, pipelineRelationChangedError, withPipelineRelationLock, samePipelineUuid } from "./pipeline-relation-scope.js";
+import {
+  assertPipelineAutomationRoot,
+  commitPipelineAutomationTransaction,
+  dispatchPipelineAutomationLedgers,
+} from "./pipeline-automation-transaction.js";
 import { secretService } from "./secrets.js";
+import { commitPipelineOperation } from "./pipeline-operation-receipts.js";
+import type { AuthorizationActor } from "./authorization.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, type ActivityPublication } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -175,7 +195,7 @@ export type PipelineAutomationExecutionResult =
   | { status: "succeeded"; execution: typeof pipelineAutomationExecutions.$inferSelect }
   | { status: "failed"; execution: typeof pipelineAutomationExecutions.$inferSelect };
 
-type PipelineDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type PipelineDb = Pick<Db | Parameters<Parameters<Db["transaction"]>[0]>[0], "select" | "insert" | "update" | "delete" | "execute">;
 
 type PipelineRetryPlanInternal = PipelineAutomationRetryPlan & {
   targetStageRow: typeof pipelineStages.$inferSelect | null;
@@ -1162,30 +1182,6 @@ function stageAutomationRoutineIdFromConfig(config?: PipelineStageConfig | null)
     : null;
 }
 
-function routineRevisionSnapshotRoutine(routine: typeof routines.$inferSelect): RoutineRevisionSnapshotV1["routine"] {
-  return {
-    id: routine.id,
-    companyId: routine.companyId,
-    projectId: routine.projectId,
-    goalId: routine.goalId,
-    parentIssueId: routine.parentIssueId,
-    title: routine.title,
-    description: routine.description,
-    assigneeAgentId: routine.assigneeAgentId,
-    priority: routine.priority as RoutineRevisionSnapshotV1["routine"]["priority"],
-    status: routine.status as RoutineRevisionSnapshotV1["routine"]["status"],
-    concurrencyPolicy: routine.concurrencyPolicy as RoutineRevisionSnapshotV1["routine"]["concurrencyPolicy"],
-    catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
-    activityGatePolicy: routine.activityGatePolicy as RoutineRevisionSnapshotV1["routine"]["activityGatePolicy"],
-    activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
-    originKind: routine.originKind,
-    originId: routine.originId,
-    variables: routine.variables ?? [],
-    env: routine.env ?? null,
-    responsibleUserId: routine.responsibleUserId ?? null,
-  };
-}
-
 function addFormVariablesForStage(stage: typeof pipelineStages.$inferSelect) {
   const variables = stageConfig(stage).variables;
   if (!Array.isArray(variables)) return [];
@@ -1486,7 +1482,16 @@ async function writeCaseEvent(
     toStageId?: string | null;
     payload?: Record<string, unknown>;
   },
-) {
+): Promise<typeof pipelineCaseEvents.$inferSelect> {
+  // Standalone post-commit/breakdown events own only this local DB transaction.
+  // They do not join a previously committed transition root.
+  if (!is(db, PgTransaction)) {
+    return (db as Db).transaction((tx) => writeCaseEvent(tx, input));
+  }
+  const detail = await getCaseWithStageForMutationOrThrow(db, input.companyId, input.caseId);
+  for (const stageId of new Set([input.fromStageId, input.toStageId])) {
+    if (stageId) await lockStageForRelation(db, detail.case.pipelineId, stageId);
+  }
   const [event] = await db
     .insert(pipelineCaseEvents)
     .values({
@@ -1499,7 +1504,8 @@ async function writeCaseEvent(
       payload: input.payload ?? {},
     })
     .returning();
-  return event!;
+  if (!event) throw pipelineRelationChangedError();
+  return event;
 }
 
 async function getPipelineOrThrow(db: PipelineDb, companyId: string, pipelineId: string) {
@@ -1539,13 +1545,49 @@ async function getCaseWithStageOrThrow(db: PipelineDb, companyId: string, caseId
   const row = await db
     .select({ case: pipelineCases, stage: pipelineStages, pipeline: pipelines })
     .from(pipelineCases)
-    .innerJoin(pipelineStages, eq(pipelineCases.stageId, pipelineStages.id))
-    .innerJoin(pipelines, eq(pipelineCases.pipelineId, pipelines.id))
-    .where(and(eq(pipelineCases.id, caseId), eq(pipelineCases.companyId, companyId), eq(pipelines.companyId, companyId)))
+    .leftJoin(pipelineStages, eq(pipelineCases.stageId, pipelineStages.id))
+    .leftJoin(pipelines, eq(pipelineCases.pipelineId, pipelines.id))
+    .where(and(eq(pipelineCases.id, caseId), eq(pipelineCases.companyId, companyId)))
     .limit(1)
     .then((rows) => rows[0] ?? null);
   if (!row) throw notFound("Pipeline case not found");
+  if (!row.pipeline || !row.stage || !samePipelineUuid(row.pipeline.companyId, companyId) || row.stage.pipelineId !== row.case.pipelineId) {
+    throw pipelineRelationScopeError();
+  }
+  return { case: row.case, stage: row.stage, pipeline: row.pipeline };
+}
+
+function assertRelationTransaction(db: PipelineDb) {
+  if (!is(db, PgTransaction)) throw conflict("Pipeline relation mutation requires a transaction", { code: "transaction_required" });
+}
+
+async function lockCaseForRelation(db: PipelineDb, companyId: string, caseId: string) {
+  assertRelationTransaction(db);
+  const [row] = await withPipelineRelationLock(() => db.select().from(pipelineCases)
+    .where(and(eq(pipelineCases.companyId, companyId), eq(pipelineCases.id, caseId)))
+    .for("update", { noWait: true }));
+  if (!row) throw pipelineRelationScopeError();
   return row;
+}
+
+async function lockStageForRelation(db: PipelineDb, pipelineId: string, stageId: string) {
+  assertRelationTransaction(db);
+  const [row] = await withPipelineRelationLock(() => db.select().from(pipelineStages)
+    .where(and(eq(pipelineStages.pipelineId, pipelineId), eq(pipelineStages.id, stageId)))
+    .for("share", { noWait: true }));
+  if (!row) throw pipelineRelationScopeError();
+  return row;
+}
+
+async function getCaseWithStageForMutationOrThrow(db: PipelineDb, companyId: string, caseId: string) {
+  const row = await lockCaseForRelation(db, companyId, caseId);
+  if (row.parentCaseId) await lockCaseForRelation(db, companyId, row.parentCaseId);
+  const [pipeline] = await withPipelineRelationLock(() => db.select().from(pipelines)
+    .where(and(eq(pipelines.companyId, companyId), eq(pipelines.id, row.pipelineId)))
+    .for("share", { noWait: true }));
+  if (!pipeline) throw pipelineRelationScopeError();
+  const stage = await lockStageForRelation(db, row.pipelineId, row.stageId);
+  return { case: row, stage, pipeline };
 }
 
 /** DB-only native observation for composed reads. Caller owns the transaction,
@@ -1569,7 +1611,7 @@ async function getCaseWithStageForUpdateOrThrow(db: PipelineDb, companyId: strin
     for update
   `);
   if (Array.from(locked).length === 0) throw notFound("Pipeline case not found");
-  return getCaseWithStageOrThrow(db, companyId, caseId);
+  return getCaseWithStageForMutationOrThrow(db, companyId, caseId);
 }
 
 async function expireLeaseIfNeeded(db: PipelineDb, row: typeof pipelineCases.$inferSelect, actor: PipelineActor) {
@@ -1588,9 +1630,9 @@ async function expireLeaseIfNeeded(db: PipelineDb, row: typeof pipelineCases.$in
       leaseExpiresAt: null,
       updatedAt: now,
     })
-    .where(and(eq(pipelineCases.id, row.id), eq(pipelineCases.leaseToken, row.leaseToken)))
+    .where(and(eq(pipelineCases.companyId, row.companyId), eq(pipelineCases.id, row.id), eq(pipelineCases.leaseToken, row.leaseToken)))
     .returning();
-  if (!updated) return row;
+  if (!updated) throw pipelineRelationChangedError();
 
   await writeCaseEvent(db, {
     companyId: row.companyId,
@@ -1615,27 +1657,72 @@ async function assertLeaseAvailable(
   return current;
 }
 
-async function assertNoOpenBlockers(db: PipelineDb, row: typeof pipelineCases.$inferSelect, toStage: typeof pipelineStages.$inferSelect) {
-  if (toStage.kind !== "working" && toStage.kind !== "done") return;
-  const blockers = await db
-    .select({
-      id: pipelineCases.id,
-      caseKey: pipelineCases.caseKey,
-      title: pipelineCases.title,
-      terminalKind: pipelineCases.terminalKind,
-    })
-    .from(pipelineCaseBlockers)
-    .innerJoin(pipelineCases, eq(pipelineCaseBlockers.blockedByCaseId, pipelineCases.id))
-    .where(
-      and(
-        eq(pipelineCaseBlockers.companyId, row.companyId),
-        eq(pipelineCaseBlockers.caseId, row.id),
-        or(isNull(pipelineCases.terminalKind), ne(pipelineCases.terminalKind, "done")),
-      ),
-    );
-  if (blockers.length > 0) {
-    throw conflict("Pipeline case is blocked", { code: "blocked", blockers });
+async function getBlockerRelationsForMutation(
+  db: PipelineDb, companyId: string, caseId: string, direction: "outgoing" | "incoming" = "outgoing", deleting = false,
+) {
+  await lockCaseForRelation(db, companyId, caseId);
+  const endpoint = direction === "outgoing" ? pipelineCaseBlockers.caseId : pipelineCaseBlockers.blockedByCaseId;
+  // Discover by owned endpoint identity, before Company or business filters.
+  const candidates = await db.select().from(pipelineCaseBlockers).where(eq(endpoint, caseId)).orderBy(asc(pipelineCaseBlockers.id));
+  if (candidates.some((row) => !samePipelineUuid(row.companyId, companyId))) throw pipelineRelationScopeError();
+  const relations = await withPipelineRelationLock(() => db.select().from(pipelineCaseBlockers)
+    .where(and(eq(endpoint, caseId), eq(pipelineCaseBlockers.companyId, companyId)))
+    .orderBy(asc(pipelineCaseBlockers.id)).for(deleting ? "update" : "share", { noWait: true }));
+  if (!isDeepStrictEqual(candidates.map((row) => row.id), relations.map((row) => row.id))) throw pipelineRelationChangedError();
+  const rows = [];
+  for (const relation of relations) {
+    const subject = await lockCaseForRelation(db, companyId, relation.caseId);
+    const blocker = await lockCaseForRelation(db, companyId, relation.blockedByCaseId);
+    rows.push({ relation, subject, blocker });
   }
+  return rows;
+}
+
+async function getLinkedIssuesForMutation(db: PipelineDb, companyId: string, caseId: string) {
+  await lockCaseForRelation(db, companyId, caseId);
+  const candidates = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.caseId, caseId))
+    .orderBy(asc(pipelineCaseIssueLinks.id));
+  if (candidates.some((row) => !samePipelineUuid(row.companyId, companyId))) throw pipelineRelationScopeError();
+  const links = await withPipelineRelationLock(() => db.select().from(pipelineCaseIssueLinks)
+    .where(and(eq(pipelineCaseIssueLinks.caseId, caseId), eq(pipelineCaseIssueLinks.companyId, companyId)))
+    .orderBy(asc(pipelineCaseIssueLinks.id)).for("update", { noWait: true }));
+  if (!isDeepStrictEqual(candidates.map((row) => row.id), links.map((row) => row.id))) throw pipelineRelationChangedError();
+  const rows = [];
+  for (const link of links) {
+    // This target will be updated; SHARE followed by UPDATE would add an upgrade.
+    const [issue] = await withPipelineRelationLock(() => db.select().from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, link.issueId)))
+      .for("no key update", { noWait: true }));
+    if (!issue) throw pipelineRelationScopeError();
+    rows.push({ link, issue });
+  }
+  return rows;
+}
+
+async function writeScopedSystemComment(db: PipelineDb, companyId: string, issueId: string, body: string) {
+  const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "system", body }).returning({ id: issueComments.id });
+  if (!comment) throw pipelineRelationChangedError();
+  const [updated] = await db.update(issues).set({ updatedAt: nowDate() })
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).returning({ id: issues.id });
+  if (!updated) throw pipelineRelationChangedError();
+}
+
+async function activeLinkedIssuesForMutation(db: PipelineDb, companyId: string, caseId: string, roles: string[]) {
+  const validated = await getLinkedIssuesForMutation(db, companyId, caseId);
+  const ids = validated.filter(({ link }) => roles.includes(link.role)).map(({ issue }) => issue.id);
+  if (ids.length === 0) return [];
+  // Original status/visibility semantics apply only after all owned links pass scope checks.
+  return db.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, ids),
+    ne(issues.status, "done"), ne(issues.status, "cancelled"), visibleIssueCondition()));
+}
+
+async function assertNoOpenBlockers(db: PipelineDb, row: typeof pipelineCases.$inferSelect, toStage: typeof pipelineStages.$inferSelect) {
+  const relations = await getBlockerRelationsForMutation(db, row.companyId, row.id);
+  if (toStage.kind !== "working" && toStage.kind !== "done") return;
+  const blockers = relations.filter(({ blocker }) => blocker.terminalKind !== "done").map(({ blocker }) => ({
+    id: blocker.id, caseKey: blocker.caseKey, title: blocker.title, terminalKind: blocker.terminalKind,
+  }));
+  if (blockers.length > 0) throw conflict("Pipeline case is blocked", { code: "blocked", blockers });
 }
 
 async function getCaseOrThrow(db: PipelineDb, companyId: string, caseId: string) {
@@ -1654,21 +1741,21 @@ async function assertValidParentCase(
   input: { companyId: string; caseId?: string | null; parentCaseId?: string | null },
 ) {
   if (!input.parentCaseId) return null;
-  if (input.caseId && input.parentCaseId === input.caseId) {
+  if (input.caseId && samePipelineUuid(input.parentCaseId, input.caseId)) {
     throw conflict("Pipeline case parent cycle detected", { code: "parent_cycle" });
   }
 
-  const parent = await getCaseOrThrow(db, input.companyId, input.parentCaseId);
+  const parent = await lockCaseForRelation(db, input.companyId, input.parentCaseId);
   let current = parent;
   let depth = 1;
   while (current.parentCaseId) {
-    if (input.caseId && current.parentCaseId === input.caseId) {
+    if (input.caseId && samePipelineUuid(current.parentCaseId, input.caseId)) {
       throw conflict("Pipeline case parent cycle detected", { code: "parent_cycle" });
     }
     if (depth >= 32) {
       throw unprocessable("Pipeline case parent depth exceeds 32", { code: "parent_depth_exceeded" });
     }
-    current = await getCaseOrThrow(db, input.companyId, current.parentCaseId);
+    current = await lockCaseForRelation(db, input.companyId, current.parentCaseId);
     depth += 1;
   }
   if (depth >= 32) {
@@ -1679,7 +1766,7 @@ async function assertValidParentCase(
 
 async function adjustParentCounts(
   db: PipelineDb,
-  input: { parentCaseId: string | null | undefined; childDelta?: number; terminalChildDelta?: number },
+  input: { companyId: string; parentCaseId: string | null | undefined; childDelta?: number; terminalChildDelta?: number },
 ) {
   if (!input.parentCaseId) return;
   const patch: Partial<typeof pipelineCases.$inferInsert> = { updatedAt: nowDate() };
@@ -1690,38 +1777,59 @@ async function adjustParentCounts(
     patch.terminalChildCount = sql`${pipelineCases.terminalChildCount} + ${input.terminalChildDelta}` as unknown as number;
   }
   if (!input.childDelta && !input.terminalChildDelta) return;
-  await db.update(pipelineCases).set(patch).where(eq(pipelineCases.id, input.parentCaseId));
+  await lockCaseForRelation(db, input.companyId, input.parentCaseId);
+  const [updated] = await db.update(pipelineCases).set(patch)
+    .where(and(eq(pipelineCases.companyId, input.companyId), eq(pipelineCases.id, input.parentCaseId))).returning({ id: pipelineCases.id });
+  if (!updated) throw pipelineRelationChangedError();
 }
 
-async function computeCaseRollup(db: PipelineDb, companyId: string, caseId: string) {
-  const rows = await db.execute(sql<{
-    id: string;
-    terminal_kind: string | null;
-  }>`
-    with recursive subtree as (
-      select id, terminal_kind from pipeline_cases where company_id = ${companyId} and id = ${caseId}
-      union all
-      select child.id, child.terminal_kind
-      from pipeline_cases child
-      join subtree parent on child.parent_case_id = parent.id
-      where child.company_id = ${companyId}
-    )
-    select id, terminal_kind from subtree
-  `);
-  const items = Array.from(rows);
-  if (items.length === 0) throw notFound("Pipeline case not found");
-  const descendants = items.slice(1);
+async function computeCaseRollup(db: PipelineDb, companyId: string, caseId: string, forMutation = false) {
+  type Member = { id: string; company_id: string; parent_case_id: string | null; terminal_kind: string | null };
+  if (forMutation) await lockCaseForRelation(db, companyId, caseId);
+  async function readMembers() {
+    const result = await db.execute(sql<Member>`
+      with recursive subtree as (
+        select id, company_id, parent_case_id, terminal_kind from pipeline_cases where company_id = ${companyId} and id = ${caseId}
+        union
+        select child.id, child.company_id, child.parent_case_id, child.terminal_kind
+        from pipeline_cases child join subtree parent on child.parent_case_id = parent.id
+      )
+      select id, company_id, parent_case_id, terminal_kind from subtree order by id
+    `);
+    const rows = Array.from(result) as unknown as Member[];
+    if (rows.length === 0) throw notFound("Pipeline case not found");
+    if (rows.some((row) => !samePipelineUuid(row.company_id, companyId))) throw pipelineRelationScopeError();
+    const members = new Map(rows.map((row) => [row.id, row]));
+    for (const row of rows) {
+      const seen = new Set<string>();
+      let current: Member | undefined = row;
+      while (current) {
+        if (seen.has(current.id) || seen.size >= 32) throw pipelineRelationScopeError();
+        seen.add(current.id);
+        current = current.parent_case_id ? members.get(current.parent_case_id) : undefined;
+      }
+    }
+    return rows;
+  }
+  const items = await readMembers();
+  if (forMutation) {
+    const locked = await withPipelineRelationLock(() => db.select({ id: pipelineCases.id }).from(pipelineCases)
+      .where(and(eq(pipelineCases.companyId, companyId), inArray(pipelineCases.id, items.map((row) => row.id))))
+      .orderBy(asc(pipelineCases.id)).for("update", { noWait: true }));
+    if (locked.length !== items.length || !isDeepStrictEqual(items, await readMembers())) throw pipelineRelationChangedError();
+  }
+  const descendants = items.filter((row) => !samePipelineUuid(row.id, caseId));
   const done = descendants.filter((item) => item.terminal_kind === "done").length;
   const cancelled = descendants.filter((item) => item.terminal_kind === "cancelled").length;
   const open = descendants.filter((item) => item.terminal_kind !== "done" && item.terminal_kind !== "cancelled").length;
   return { total: descendants.length, done, cancelled, open, complete: open === 0 };
 }
 
-async function hasBlockersResolvedForLatestBlockerSet(db: PipelineDb, caseId: string) {
+async function hasBlockersResolvedForLatestBlockerSet(db: PipelineDb, companyId: string, caseId: string) {
   const latestBlockersSet = await db
     .select({ createdAt: pipelineCaseEvents.createdAt })
     .from(pipelineCaseEvents)
-    .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "blockers_set")))
+    .where(and(eq(pipelineCaseEvents.companyId, companyId), eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "blockers_set")))
     .orderBy(desc(pipelineCaseEvents.createdAt))
     .limit(1)
     .then((rows) => rows[0] ?? null);
@@ -1730,7 +1838,7 @@ async function hasBlockersResolvedForLatestBlockerSet(db: PipelineDb, caseId: st
     .select({ id: pipelineCaseEvents.id })
     .from(pipelineCaseEvents)
     .where(and(
-      eq(pipelineCaseEvents.caseId, caseId),
+      eq(pipelineCaseEvents.companyId, companyId), eq(pipelineCaseEvents.caseId, caseId),
       eq(pipelineCaseEvents.type, "blockers_resolved"),
       latestBlockersSet ? sql`${pipelineCaseEvents.createdAt} > ${latestBlockersSet.createdAt.toISOString()}` : undefined,
     ))
@@ -1741,6 +1849,7 @@ async function hasBlockersResolvedForLatestBlockerSet(db: PipelineDb, caseId: st
 
 async function hasChildrenTerminalEventForRollup(
   db: PipelineDb,
+  companyId: string,
   caseId: string,
   stageId: string,
   rollup: Awaited<ReturnType<typeof computeCaseRollup>>,
@@ -1749,7 +1858,7 @@ async function hasChildrenTerminalEventForRollup(
     .select({ createdAt: pipelineCaseEvents.createdAt })
     .from(pipelineCaseEvents)
     .where(and(
-      eq(pipelineCaseEvents.caseId, caseId),
+      eq(pipelineCaseEvents.companyId, companyId), eq(pipelineCaseEvents.caseId, caseId),
       inArray(pipelineCaseEvents.type, ["ingested", "transitioned", "automation_retry_dispatched"]),
       eq(pipelineCaseEvents.toStageId, stageId),
     ))
@@ -1760,7 +1869,7 @@ async function hasChildrenTerminalEventForRollup(
     .select({ id: pipelineCaseEvents.id })
     .from(pipelineCaseEvents)
     .where(and(
-      eq(pipelineCaseEvents.caseId, caseId),
+      eq(pipelineCaseEvents.companyId, companyId), eq(pipelineCaseEvents.caseId, caseId),
       eq(pipelineCaseEvents.type, "children_terminal"),
       sql`${pipelineCaseEvents.payload} -> 'rollup' = ${JSON.stringify(rollup)}::jsonb`,
       stageEntry ? sql`${pipelineCaseEvents.createdAt} > ${stageEntry.createdAt.toISOString()}::timestamptz` : undefined,
@@ -1926,47 +2035,26 @@ async function assertLatestReviewApprovalStillCurrent(
 
 async function postSystemCommentOnLinkedIssues(
   db: PipelineDb,
-  input: {
-    companyId: string;
-    caseId: string;
-    roles: Array<"origin" | "conversation" | "work" | "automation">;
-    body: string;
-  },
+  input: { companyId: string; caseId: string; roles: Array<"origin" | "conversation" | "work" | "automation">; body: string },
 ) {
-  const rows = await db
-    .select({ issueId: issues.id })
-    .from(pipelineCaseIssueLinks)
-    .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
-    .where(and(
-      eq(pipelineCaseIssueLinks.companyId, input.companyId),
-      eq(pipelineCaseIssueLinks.caseId, input.caseId),
-      inArray(pipelineCaseIssueLinks.role, input.roles),
-      ne(issues.status, "done"),
-      ne(issues.status, "cancelled"),
-      visibleIssueCondition(),
-    ));
-
-  for (const row of rows) {
-    await db.insert(issueComments).values({
-      companyId: input.companyId,
-      issueId: row.issueId,
-      authorType: "system",
-      body: input.body,
-    });
-    await db.update(issues).set({ updatedAt: nowDate() }).where(eq(issues.id, row.issueId));
-  }
+  const rows = await activeLinkedIssuesForMutation(db, input.companyId, input.caseId, input.roles);
+  for (const row of rows) await writeScopedSystemComment(db, input.companyId, row.id, input.body);
 }
 
-async function getAncestorCases(db: PipelineDb, companyId: string, parentCaseId: string | null | undefined) {
+async function getAncestorCases(db: PipelineDb, companyId: string, parentCaseId: string | null | undefined, forMutation = false) {
   const ancestors: Array<{
     case: typeof pipelineCases.$inferSelect;
     stage: typeof pipelineStages.$inferSelect;
   }> = [];
   let nextId = parentCaseId ?? null;
   let depth = 0;
+  const seen = new Set<string>();
   while (nextId) {
-    if (depth >= 32) break;
-    const row = await getCaseWithStageOrThrow(db, companyId, nextId);
+    if (depth >= 32 || seen.has(nextId)) throw pipelineRelationScopeError();
+    seen.add(nextId);
+    const row = forMutation
+      ? await getCaseWithStageForMutationOrThrow(db, companyId, nextId)
+      : await getCaseWithStageOrThrow(db, companyId, nextId);
     ancestors.push(row);
     nextId = row.case.parentCaseId;
     depth += 1;
@@ -1975,34 +2063,17 @@ async function getAncestorCases(db: PipelineDb, companyId: string, parentCaseId:
 }
 
 async function handleBlockersResolved(db: PipelineDb, companyId: string, blockerCaseId: string) {
-  const blockedRows = await db
-    .select({ caseId: pipelineCaseBlockers.caseId })
-    .from(pipelineCaseBlockers)
-    .where(and(eq(pipelineCaseBlockers.companyId, companyId), eq(pipelineCaseBlockers.blockedByCaseId, blockerCaseId)));
-
-  for (const blocked of blockedRows) {
-    const [{ count }] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(pipelineCaseBlockers)
-      .innerJoin(pipelineCases, eq(pipelineCaseBlockers.blockedByCaseId, pipelineCases.id))
-      .where(and(
-        eq(pipelineCaseBlockers.companyId, companyId),
-        eq(pipelineCaseBlockers.caseId, blocked.caseId),
-        or(isNull(pipelineCases.terminalKind), ne(pipelineCases.terminalKind, "done")),
-      ));
-    if ((count ?? 0) > 0 || await hasBlockersResolvedForLatestBlockerSet(db, blocked.caseId)) continue;
+  const blockedRows = await getBlockerRelationsForMutation(db, companyId, blockerCaseId, "incoming");
+  for (const { subject: blocked } of blockedRows) {
+    const remaining = await getBlockerRelationsForMutation(db, companyId, blocked.id);
+    if (remaining.some(({ blocker }) => blocker.terminalKind !== "done") || await hasBlockersResolvedForLatestBlockerSet(db, companyId, blocked.id)) continue;
     await writeCaseEvent(db, {
-      companyId,
-      caseId: blocked.caseId,
-      type: "blockers_resolved",
-      actor: { type: "system" },
+      companyId, caseId: blocked.id, type: "blockers_resolved", actor: { type: "system" },
       payload: { resolvedByCaseId: blockerCaseId },
     });
     await postSystemCommentOnLinkedIssues(db, {
-      companyId,
-      caseId: blocked.caseId,
-      roles: ["work"],
-      body: `Pipeline blockers resolved for case ${blocked.caseId}. The case can be retried now that blocker ${blockerCaseId} is done.`,
+      companyId, caseId: blocked.id, roles: ["work"],
+      body: `Pipeline blockers resolved for case ${blocked.id}. The case can be retried now that blocker ${blockerCaseId} is done.`,
     });
   }
 }
@@ -2016,38 +2087,12 @@ async function notifyDependentWorkIssuesOfUpstreamContentChange(
     version: number;
   },
 ) {
-  const dependents = await db
-    .select({ dependentCase: pipelineCases })
-    .from(pipelineCaseBlockers)
-    .innerJoin(pipelineCases, eq(pipelineCaseBlockers.caseId, pipelineCases.id))
-    .where(and(
-      eq(pipelineCaseBlockers.companyId, input.companyId),
-      eq(pipelineCaseBlockers.blockedByCaseId, input.upstreamCase.id),
-      eq(pipelineCases.companyId, input.companyId),
-      isNull(pipelineCases.terminalKind),
-    ));
-
-  if (dependents.length === 0) return;
-
-  const dependentCaseIds = dependents.map((row) => row.dependentCase.id);
-  const linkRows = await db
-    .select({ caseId: pipelineCaseIssueLinks.caseId, issueId: issues.id })
-    .from(pipelineCaseIssueLinks)
-    .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
-    .where(and(
-      eq(pipelineCaseIssueLinks.companyId, input.companyId),
-      inArray(pipelineCaseIssueLinks.caseId, dependentCaseIds),
-      eq(pipelineCaseIssueLinks.role, "work"),
-      eq(issues.companyId, input.companyId),
-      ne(issues.status, "done"),
-      ne(issues.status, "cancelled"),
-      visibleIssueCondition(),
-    ));
+  const relations = await getBlockerRelationsForMutation(db, input.companyId, input.upstreamCase.id, "incoming");
+  const dependents = relations.filter(({ subject }) => subject.terminalKind === null).map(({ subject }) => ({ dependentCase: subject }));
   const issueIdsByCase = new Map<string, string[]>();
-  for (const row of linkRows) {
-    const list = issueIdsByCase.get(row.caseId) ?? [];
-    list.push(row.issueId);
-    issueIdsByCase.set(row.caseId, list);
+  for (const { dependentCase } of dependents) {
+    const rows = await activeLinkedIssuesForMutation(db, input.companyId, dependentCase.id, ["work"]);
+    issueIdsByCase.set(dependentCase.id, rows.map((row) => row.id));
   }
 
   const upstreamLink = buildCaseDeepLink({
@@ -2062,13 +2107,7 @@ async function notifyDependentWorkIssuesOfUpstreamContentChange(
     for (const issueId of issueIds) {
       if (notifiedIssueIds.has(issueId)) continue;
       notifiedIssueIds.add(issueId);
-      await db.insert(issueComments).values({
-        companyId: input.companyId,
-        issueId,
-        authorType: "system",
-        body,
-      });
-      await db.update(issues).set({ updatedAt: nowDate() }).where(eq(issues.id, issueId));
+      await writeScopedSystemComment(db, input.companyId, issueId, body);
     }
     // The drift event intentionally does not bump the dependent case's
     // updatedAt: "unresolved drift" is derived as event.createdAt > case.updatedAt.
@@ -2093,35 +2132,28 @@ async function validateBlockerSet(
   db: PipelineDb,
   input: { companyId: string; caseId: string; blockedByCaseIds: string[] },
 ) {
-  const uniqueBlockerIds = [...new Set(input.blockedByCaseIds)];
+  const uniqueBlockerIds = [...new Set(input.blockedByCaseIds.map((id) => id.toLowerCase()))];
   if (uniqueBlockerIds.length !== input.blockedByCaseIds.length) {
     throw unprocessable("Pipeline blocker set contains duplicate cases", { code: "validation" });
   }
-  if (uniqueBlockerIds.includes(input.caseId)) {
+  if (uniqueBlockerIds.includes(input.caseId.toLowerCase())) {
     throw conflict("Pipeline case cannot block itself", { code: "blocker_cycle" });
   }
   if (uniqueBlockerIds.length === 0) return uniqueBlockerIds;
 
-  const rows = await db
-    .select({ id: pipelineCases.id })
-    .from(pipelineCases)
-    .where(and(eq(pipelineCases.companyId, input.companyId), inArray(pipelineCases.id, uniqueBlockerIds)));
-  if (rows.length !== uniqueBlockerIds.length) throw notFound("Pipeline blocker case not found");
+  for (const caseId of uniqueBlockerIds) await lockCaseForRelation(db, input.companyId, caseId);
 
   const stack = [...uniqueBlockerIds];
   const seen = new Set<string>();
   while (stack.length) {
     const current = stack.pop()!;
-    if (current === input.caseId) {
+    if (samePipelineUuid(current, input.caseId)) {
       throw conflict("Pipeline blocker cycle detected", { code: "blocker_cycle" });
     }
     if (seen.has(current)) continue;
     seen.add(current);
-    const next = await db
-      .select({ blockedByCaseId: pipelineCaseBlockers.blockedByCaseId })
-      .from(pipelineCaseBlockers)
-      .where(and(eq(pipelineCaseBlockers.companyId, input.companyId), eq(pipelineCaseBlockers.caseId, current)));
-    stack.push(...next.map((row) => row.blockedByCaseId));
+    const next = await getBlockerRelationsForMutation(db, input.companyId, current);
+    stack.push(...next.map(({ blocker }) => blocker.id));
   }
 
   return uniqueBlockerIds;
@@ -2181,8 +2213,20 @@ async function enqueueStageAutomationLedger(
     generation?: number;
   },
 ) {
-  const automation = stageAutomation(input.stage);
+  const detail = await getCaseWithStageForMutationOrThrow(db, input.companyId, input.caseId);
+  if (input.stage.pipelineId !== detail.case.pipelineId) throw pipelineRelationScopeError();
+  const stage = await lockStageForRelation(db, detail.case.pipelineId, input.stage.id);
+  if (!isDeepStrictEqual(stage, input.stage)) throw pipelineRelationChangedError();
+  const automation = stageAutomation(stage);
   if (!automation) return null;
+  const [event] = await withPipelineRelationLock(() => db.select().from(pipelineCaseEvents)
+    .where(and(eq(pipelineCaseEvents.companyId, input.companyId), eq(pipelineCaseEvents.caseId, input.caseId), eq(pipelineCaseEvents.id, input.eventId)))
+    .for("share", { noWait: true }));
+  if (!event || event.toStageId !== stage.id) throw pipelineRelationScopeError();
+  const [routine] = await withPipelineRelationLock(() => db.select({ id: routines.id }).from(routines)
+    .where(and(eq(routines.companyId, input.companyId), eq(routines.id, automation.routineId)))
+    .for("share", { noWait: true }));
+  if (!routine) throw pipelineRelationScopeError();
   await assertOnisallExecutionAdmission(db, input.companyId, input.caseId);
   const [ledger] = await db
     .insert(pipelineAutomationExecutions)
@@ -2283,7 +2327,10 @@ export async function ingestPipelineCaseInTransaction(
   const caseKey = input.caseKey ?? randomUUID();
   assertCaseKey(caseKey);
 
-  const pipeline = await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+  const [pipeline] = await withPipelineRelationLock(() => tx.select().from(pipelines)
+    .where(and(eq(pipelines.companyId, input.companyId), eq(pipelines.id, input.pipelineId)))
+    .for("share", { noWait: true }));
+  if (!pipeline) throw notFound("Pipeline not found");
   if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
   const requestKey = input.requestKey?.trim() || null;
   const parentCase = await assertValidParentCase(tx, { companyId: input.companyId, parentCaseId: input.parentCaseId ?? null });
@@ -2295,14 +2342,18 @@ export async function ingestPipelineCaseInTransaction(
       .select()
       .from(pipelineCases)
       .where(and(
-        eq(pipelineCases.companyId, input.companyId),
         eq(pipelineCases.parentCaseId, parentCase.id),
         eq(pipelineCases.requestKey, requestKey),
         isNull(pipelineCases.retiredAt),
       ))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    if (existingByRequestKey) return { case: existingByRequestKey, created: false };
+    if (existingByRequestKey) {
+      if (!samePipelineUuid(existingByRequestKey.companyId, input.companyId)) throw pipelineRelationScopeError();
+      const detail = await getCaseWithStageForMutationOrThrow(tx, input.companyId, existingByRequestKey.id);
+      if (!isDeepStrictEqual(existingByRequestKey, detail.case)) throw pipelineRelationChangedError();
+      return { case: detail.case, created: false };
+    }
   }
   const automationAttempt = input.actor.type === "agent"
     ? await resolveAutomationAttemptForActorRun(tx, input.companyId, input.actor.runId)
@@ -2320,7 +2371,7 @@ export async function ingestPipelineCaseInTransaction(
       ...Array.from(blockedByCaseKeyMap.values()),
     ],
   });
-  const stage = input.stageKey
+  const selectedStage = input.stageKey
     ? await getStageByKeyOrThrow(tx, input.pipelineId, input.stageKey)
     : await tx
       .select()
@@ -2329,7 +2380,9 @@ export async function ingestPipelineCaseInTransaction(
       .orderBy(asc(pipelineStages.position), asc(pipelineStages.createdAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  if (!stage) throw unprocessable("Pipeline has no stages", { code: "validation" });
+  if (!selectedStage) throw unprocessable("Pipeline has no stages", { code: "validation" });
+  const stage = await lockStageForRelation(tx, input.pipelineId, selectedStage.id);
+  if (!isDeepStrictEqual(selectedStage, stage)) throw pipelineRelationChangedError();
   assertStageEnabled(stage, "ingest");
   validateAddFormFieldsForStage(stage, input.fields ?? {});
 
@@ -2363,8 +2416,7 @@ export async function ingestPipelineCaseInTransaction(
         .select()
         .from(pipelineCases)
         .where(and(
-          eq(pipelineCases.companyId, input.companyId),
-          eq(pipelineCases.parentCaseId, parentCase.id),
+            eq(pipelineCases.parentCaseId, parentCase.id),
           eq(pipelineCases.requestKey, requestKey),
           isNull(pipelineCases.retiredAt),
         ))
@@ -2378,7 +2430,10 @@ export async function ingestPipelineCaseInTransaction(
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!existing) throw conflict("Pipeline case ingest conflict", { code: "ingest_conflict" });
-    return { case: existing, created: false };
+    if (!samePipelineUuid(existing.companyId, input.companyId)) throw pipelineRelationScopeError();
+    const detail = await getCaseWithStageForMutationOrThrow(tx, input.companyId, existing.id);
+    if (!isDeepStrictEqual(existing, detail.case)) throw pipelineRelationChangedError();
+    return { case: detail.case, created: false };
   }
 
   await ensurePipelineCaseBodyDocumentFromSummary(tx, {
@@ -2397,6 +2452,7 @@ export async function ingestPipelineCaseInTransaction(
     payload: { caseKey, requestKey, parentCaseVersion: inserted.parentCaseVersion },
   });
   await adjustParentCounts(tx, {
+    companyId: input.companyId,
     parentCaseId: inserted.parentCaseId,
     childDelta: 1,
     terminalChildDelta: isTerminalKind(inserted.terminalKind) ? 1 : 0,
@@ -2436,8 +2492,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
   const authorization = authorizationService(db);
   const secretsSvc = secretService(db);
 
-  async function assertRoutineInCompany(companyId: string, routineId: string) {
-    const routine = await db
+  async function assertRoutineInCompany(companyId: string, routineId: string, executor: PipelineDb = db) {
+    const routine = await executor
       .select({ id: routines.id, companyId: routines.companyId, assigneeAgentId: routines.assigneeAgentId })
       .from(routines)
       .where(eq(routines.id, routineId))
@@ -2450,10 +2506,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     return routine;
   }
 
-  async function validateStageAutomationConfig(companyId: string, config?: PipelineStageConfig | null) {
+  async function validateStageAutomationConfig(companyId: string, config?: PipelineStageConfig | null, executor: PipelineDb = db) {
     const onEnter = config?.onEnter;
     if (!onEnter || onEnter.type !== "run_routine" || !onEnter.routineId) return;
-    await assertRoutineInCompany(companyId, onEnter.routineId);
+    await assertRoutineInCompany(companyId, onEnter.routineId, executor);
   }
 
   async function loadBreakdownTarget(
@@ -2897,11 +2953,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         revisionNumber,
         title: routine.title,
         description: routine.description,
-        snapshot: {
-          version: 1,
-          routine: routineRevisionSnapshotRoutine(routine),
-          triggers: [],
-        },
+        snapshot: await buildRoutineRevisionSnapshot(dbOrTx, routine),
         changeSummary,
         createdByAgentId: actorPatch.agentId,
         createdByUserId: actorPatch.userId,
@@ -2948,6 +3000,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           .select()
           .from(routines)
           .where(and(eq(routines.id, input.previousRoutineId), eq(routines.companyId, input.companyId)))
+          .for("update")
           .then((rows) => rows[0] ?? null)
       : null;
     const canReusePrevious =
@@ -3085,6 +3138,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
   async function clearPipelineAutomationRoutineIfUnreferenced(
     dbOrTx: PipelineDb,
     input: { companyId: string; pipelineId: string; routineId: string; exceptStageId?: string | null; actor: PipelineActor },
+    postCommitPublications?: ActivityPublication[],
   ) {
     const stillReferenced = await routineStillReferencedByAnyPipeline(dbOrTx, input);
     if (stillReferenced) return;
@@ -3099,7 +3153,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       .returning({ id: routines.id, originId: routines.originId });
     if (updated.length === 0) return;
     const actorPatch = activityActorPatch(input.actor);
-    await logActivity(dbOrTx as Db, {
+    await logActivity(dbOrTx, {
       companyId: input.companyId,
       ...actorPatch,
       action: "routine.origin_cleared",
@@ -3109,12 +3163,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         previousOriginKind: "pipeline_automation",
         previousOriginId: updated[0]?.originId ?? null,
       },
-    });
+    }, postCommitPublications);
   }
 
-  async function validateStageTargets(companyId: string, pipelineId: string, kind: PipelineStageKind | string, config: PipelineStageConfig) {
+  async function validateStageTargets(companyId: string, pipelineId: string, kind: PipelineStageKind | string, config: PipelineStageConfig, executor: PipelineDb = db) {
     if (kind !== "review") return;
-    const rows = await db
+    const rows = await executor
       .select({ key: pipelineStages.key })
       .from(pipelineStages)
       .innerJoin(pipelines, eq(pipelineStages.pipelineId, pipelines.id))
@@ -3296,17 +3350,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
   }
 
   async function executeAutomationLedgers(
-    ledgers: Array<typeof pipelineAutomationExecutions.$inferSelect>,
+    ledgers: readonly (typeof pipelineAutomationExecutions.$inferSelect)[],
     actor: PipelineActor = { type: "system" },
   ) {
-    const results = new Map<string, PipelineAutomationExecutionResult>();
-    const seen = new Set<string>();
-    for (const ledger of ledgers) {
-      if (seen.has(ledger.id)) continue;
-      seen.add(ledger.id);
-      results.set(ledger.id, await executeAutomationLedger(ledger.id, actor));
-    }
-    return results;
+    return dispatchPipelineAutomationLedgers(ledgers, (executionId) => executeAutomationLedger(executionId, actor));
   }
 
   async function patchCaseContentInTransaction(
@@ -3325,7 +3372,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     },
   ) {
     if (input.fields !== undefined) assertJsonSize(input.fields, "fields");
-    const { case: existing, stage } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+    const { case: existing, stage } = await getCaseWithStageForMutationOrThrow(tx, input.companyId, input.caseId);
     const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
     if (input.expectedVersion !== undefined && current.version !== input.expectedVersion) {
       throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, stage));
@@ -3361,7 +3408,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     const [updated] = await tx
       .update(pipelineCases)
       .set(patch)
-      .where(and(eq(pipelineCases.id, current.id), eq(pipelineCases.version, current.version)))
+      .where(and(eq(pipelineCases.companyId, input.companyId), eq(pipelineCases.id, current.id), eq(pipelineCases.version, current.version)))
       .returning();
     if (!updated) {
       const latest = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
@@ -3386,11 +3433,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     if (parentCaseChanged) {
       const terminalDelta = isTerminalKind(current.terminalKind) ? 1 : 0;
       await adjustParentCounts(tx, {
+        companyId: input.companyId,
         parentCaseId: current.parentCaseId,
         childDelta: -1,
         terminalChildDelta: -terminalDelta,
       });
       await adjustParentCounts(tx, {
+        companyId: input.companyId,
         parentCaseId: input.parentCaseId,
         childDelta: 1,
         terminalChildDelta: terminalDelta,
@@ -3410,25 +3459,32 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     return { case: updated, event };
   }
 
-  async function transitionCaseInTransaction(
-    tx: PipelineDb,
-    input: {
-      companyId: string;
-      caseId: string;
-      toStageId?: string;
-      toStageKey?: string;
-      expectedVersion: number;
-      leaseToken?: string | null;
-      actor: PipelineActor;
-      transitionClass?: "manual" | "suggested" | "auto";
-      suggestionId?: string;
-      reason?: string | null;
-      force?: boolean;
-      automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
-      autoAdvanceVisitedStageIds?: Set<string>;
-      skipChildrenTerminalGate?: boolean;
-    },
-  ) {
+  type CaseTransitionInput = {
+    companyId: string;
+    caseId: string;
+    toStageId?: string;
+    toStageKey?: string;
+    expectedVersion: number;
+    leaseToken?: string | null;
+    actor: PipelineActor;
+    transitionClass?: "manual" | "suggested" | "auto";
+    suggestionId?: string;
+    reason?: string | null;
+    force?: boolean;
+    automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
+    autoAdvanceVisitedStageIds?: Set<string>;
+    skipChildrenTerminalGate?: boolean;
+  };
+
+  type CaseTransitionResult = {
+    case: typeof pipelineCases.$inferSelect;
+    event: typeof pipelineCaseEvents.$inferSelect;
+    automationLedger: typeof pipelineAutomationExecutions.$inferSelect | null;
+  };
+
+  // Pre-application checks retain the existing Case lock and lease expiry
+  // behavior. This is not a pure read or a workflow/configuration fence.
+  async function prepareCaseTransitionInTransaction(tx: PipelineDb, input: CaseTransitionInput) {
     if (input.transitionClass === "auto" && input.actor.type !== "system") {
       throw unprocessable("Pipeline auto autonomy is not enabled", { code: "autonomy_not_enabled" });
     }
@@ -3439,9 +3495,11 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, fromStage));
     }
 
-    const toStage = input.toStageId
+    const selectedStage = input.toStageId
       ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
+    const toStage = await lockStageForRelation(tx, current.pipelineId, selectedStage.id);
+    if (!isDeepStrictEqual(selectedStage, toStage)) throw pipelineRelationChangedError();
     assertStageEnabled(toStage, "transition");
     if (fromStage.id !== toStage.id) {
       assertActorCanApproveStageExit(fromStage, input.actor);
@@ -3479,6 +3537,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     await assertNoOpenBlockers(tx, current, toStage);
 
     const enteringTerminal = terminalKindForStage(toStage.kind);
+    return { input, current, fromStage, toStage, forcedTransition, enteringTerminal };
+  }
+
+  async function applyCaseTransitionInTransaction(
+    tx: PipelineDb,
+    prepared: Awaited<ReturnType<typeof prepareCaseTransitionInTransaction>>,
+  ): Promise<CaseTransitionResult> {
+    const { input, current, fromStage, toStage, forcedTransition, enteringTerminal } = prepared;
     const [updated] = await tx
       .update(pipelineCases)
       .set({
@@ -3494,7 +3560,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         leaseExpiresAt: enteringTerminal ? null : current.leaseExpiresAt,
         updatedAt: nowDate(),
       })
-      .where(and(eq(pipelineCases.id, current.id), eq(pipelineCases.version, current.version)))
+      .where(and(eq(pipelineCases.companyId, input.companyId), eq(pipelineCases.id, current.id), eq(pipelineCases.version, current.version)))
       .returning();
     if (!updated) {
       const latest = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
@@ -3543,6 +3609,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     const isTerminal = isTerminalKind(updated.terminalKind);
     if (current.parentCaseId && wasTerminal !== isTerminal) {
       await adjustParentCounts(tx, {
+        companyId: input.companyId,
         parentCaseId: current.parentCaseId,
         terminalChildDelta: isTerminal ? 1 : -1,
       });
@@ -3565,6 +3632,11 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     return { case: updated, event, automationLedger: ledger };
   }
 
+  async function transitionCaseInTransaction(tx: PipelineDb, input: CaseTransitionInput): Promise<CaseTransitionResult> {
+    const prepared = await prepareCaseTransitionInTransaction(tx, input);
+    return applyCaseTransitionInTransaction(tx, prepared);
+  }
+
   // A case can enter an auto-advance stage after its children are already
   // terminal (e.g. children triaged during review, then the case moves to
   // producing). handleChildrenTerminal only fires when a child transitions,
@@ -3584,14 +3656,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     if (!toStageKey) return;
     const visited = input.visitedStageIds ?? new Set<string>();
     if (visited.has(input.stage.id)) return;
-    const rollup = await computeCaseRollup(tx, input.companyId, input.caseRow.id);
+    const rollup = await computeCaseRollup(tx, input.companyId, input.caseRow.id, true);
     if (!rollup.complete || (rollup.total === 0 && !gate.explicitZeroChildrenPass)) return;
     const toStage = await getStageByKeyOrThrow(tx, input.caseRow.pipelineId, toStageKey);
     if (toStage.id === input.stage.id) return;
     visited.add(input.stage.id);
-    try {
+    await attemptPipelineAutoAdvance(async () => {
       assertStageEnabled(toStage, "auto_advance");
-      await transitionCaseInTransaction(tx, {
+      return prepareCaseTransitionInTransaction(tx, {
         companyId: input.companyId,
         caseId: input.caseRow.id,
         toStageKey,
@@ -3602,11 +3674,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         automationLedgers: input.automationLedgers,
         autoAdvanceVisitedStageIds: visited,
       });
-    } catch (error) {
-      // Best-effort: an unsatisfied gate (drift, approval) on the chained
-      // advance must not roll back the transition that entered this stage.
-      if (!(error instanceof HttpError)) throw error;
-    }
+    }, (prepared) => applyCaseTransitionInTransaction(tx, prepared));
   }
 
   async function handleChildrenTerminal(
@@ -3616,16 +3684,16 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>,
     options: { allowExplicitZeroChildrenPass?: boolean } = {},
   ) {
-    const ancestors = await getAncestorCases(tx, companyId, parentCaseId);
+    const ancestors = await getAncestorCases(tx, companyId, parentCaseId, true);
     for (const ancestor of ancestors) {
-      const rollup = await computeCaseRollup(tx, companyId, ancestor.case.id);
+      const rollup = await computeCaseRollup(tx, companyId, ancestor.case.id, true);
       const gate = childrenGateConfig(stageConfig(ancestor.stage), {
         explicitZeroChildrenPass: options.allowExplicitZeroChildrenPass,
       });
       if (
         !rollup.complete ||
         (rollup.total === 0 && !gate.explicitZeroChildrenPass) ||
-        await hasChildrenTerminalEventForRollup(tx, ancestor.case.id, ancestor.stage.id, rollup)
+        await hasChildrenTerminalEventForRollup(tx, companyId, ancestor.case.id, ancestor.stage.id, rollup)
       ) {
         continue;
       }
@@ -3647,11 +3715,11 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       if (!toStageKey || isTerminalKind(ancestor.case.terminalKind)) {
         continue;
       }
-      try {
+      await attemptPipelineAutoAdvance(async () => {
         const toStage = await getStageByKeyOrThrow(tx, ancestor.case.pipelineId, toStageKey);
         assertStageEnabled(toStage, "auto_advance");
-        if (toStage.id === ancestor.stage.id) continue;
-        await transitionCaseInTransaction(tx, {
+        if (toStage.id === ancestor.stage.id) return null;
+        return prepareCaseTransitionInTransaction(tx, {
           companyId,
           caseId: ancestor.case.id,
           toStageKey,
@@ -3661,11 +3729,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           reason: "children_terminal",
           automationLedgers,
         });
-      } catch (error) {
-        // Best-effort: an unsatisfied gate (drift, approval, blocker) on the
-        // parent advance must not roll back the child transition that triggered it.
-        if (!(error instanceof HttpError)) throw error;
-      }
+      }, async (prepared) => prepared ? applyCaseTransitionInTransaction(tx, prepared) : undefined);
     }
   }
 
@@ -3676,18 +3740,15 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       ingest: Awaited<ReturnType<typeof ingestPipelineCaseInTransaction>>,
     ) => Promise<TRelated>,
   ) {
-    if (is(db, PgTransaction)) {
-      throw conflict("Case ingest dispatch requires the root database", { code: "root_database_required" });
-    }
-    const { result, related } = await db.transaction(async (tx) => {
+    const { result: { result, related }, automationLedgers } = await commitPipelineAutomationTransaction(db, async (tx, automationLedgers) => {
       const preparedInput = typeof input === "function" ? await input(tx) : input;
       const result = await ingestPipelineCaseInTransaction(tx, preparedInput);
       const related = await persistRelated(tx, result);
+      if ("automationLedger" in result && result.automationLedger) {
+        automationLedgers.push(result.automationLedger);
+      }
       return { result, related };
     });
-    const automationLedgers = "automationLedger" in result && result.automationLedger
-      ? [result.automationLedger]
-      : [];
     const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
     if ("automationLedger" in result && result.automationLedger) {
       return { ingest: {
@@ -3701,6 +3762,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
 
   const service = {
     resolveBreakdownTarget,
+
+    async updatePipeline(input: PipelineMetadataMutation) {
+      if (is(db, PgTransaction)) throw conflict("Pipeline configuration requires a root Db", { code: "root_database_required" });
+      const result = await db.transaction((tx) => updatePipelineConfigurationInTransaction(tx, input));
+      publishPipelineConfigurationActivity(result.publication);
+      return result.pipeline;
+    },
+
+    async replaceTransitions(input: PipelineTransitionsMutation) {
+      if (is(db, PgTransaction)) throw conflict("Pipeline configuration requires a root Db", { code: "root_database_required" });
+      const result = await db.transaction((tx) => replacePipelineTransitionsInTransaction(tx, input));
+      publishPipelineConfigurationActivity(result.publication);
+      return result.transitions;
+    },
 
     async createPipeline(input: {
       companyId: string;
@@ -3871,24 +3946,25 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       };
       actor?: PipelineActor;
     }) {
-      await getPipelineOrThrow(db, input.companyId, input.pipelineId);
-      const existing = await getStageOrThrow(db, input.pipelineId, input.stageId);
-      const kind = normalizeStageKind(input.patch.kind ?? existing.kind);
-      const previousRoutineId = stageAutomationRoutineIdFromConfig(stageConfig(existing));
-      const automationRequest = input.patch.config !== undefined
-        ? readStageAutomationRequest(input.patch.config)
-        : null;
-      const stageName = input.patch.name ?? existing.name;
-      let config = normalizeStageConfig(kind, input.patch.config !== undefined ? input.patch.config : stageConfig(existing));
-      if (automationRequest) {
-        config = reconcilePipelineStageConfigVariables(config, [
-          automationRequest.titleTemplate ?? PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
-          automationRequest.instructionsBody,
-        ]);
-      }
-      await validateStageTargets(input.companyId, input.pipelineId, kind, config);
-      await validateStageAutomationConfig(input.companyId, config);
       return db.transaction(async (tx) => {
+        await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+        const [existing] = await tx.select().from(pipelineStages)
+          .where(and(eq(pipelineStages.id, input.stageId), eq(pipelineStages.pipelineId, input.pipelineId)))
+          .for("update");
+        if (!existing) throw notFound("Pipeline stage not found");
+        const kind = normalizeStageKind(input.patch.kind ?? existing.kind);
+        const previousRoutineId = stageAutomationRoutineIdFromConfig(stageConfig(existing));
+        const automationRequest = input.patch.config !== undefined ? readStageAutomationRequest(input.patch.config) : null;
+        const stageName = input.patch.name ?? existing.name;
+        let config = normalizeStageConfig(kind, input.patch.config !== undefined ? input.patch.config : stageConfig(existing));
+        if (automationRequest) {
+          config = reconcilePipelineStageConfigVariables(config, [
+            automationRequest.titleTemplate ?? PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
+            automationRequest.instructionsBody,
+          ]);
+        }
+        await validateStageTargets(input.companyId, input.pipelineId, kind, config, tx);
+        await validateStageAutomationConfig(input.companyId, config, tx);
         const nextConfig = automationRequest
           ? await syncPipelineStageAutomation(tx, {
               companyId: input.companyId,
@@ -3945,25 +4021,17 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       baseRoutineRevisionId?: string | null;
       actor: PipelineActor;
     }) {
-      await getPipelineOrThrow(db, input.companyId, input.pipelineId);
-      const stage = await getStageOrThrow(db, input.pipelineId, input.stageId);
-      const routineId = stageAutomationRoutineIdFromConfig(stageConfig(stage));
-      if (!routineId) {
-        throw unprocessable("Pipeline stage does not have automation configured", {
-          code: "stage_automation_required",
-        });
-      }
-
-      const normalizedEnv = input.env === null
-        ? null
-        : await secretsSvc.normalizeEnvBindingsForPersistence(input.companyId, input.env, {
-            strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
-            fieldPath: "env",
-          }) as Record<string, EnvBinding>;
       const actorPatch = routineActorPatch(input.actor);
       const updatedRoutine = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routineId} for update`);
+        await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+        const [stage] = await tx.select().from(pipelineStages)
+          .where(and(eq(pipelineStages.id, input.stageId), eq(pipelineStages.pipelineId, input.pipelineId)))
+          .for("update");
+        if (!stage) throw notFound("Pipeline stage not found");
+        const routineId = stageAutomationRoutineIdFromConfig(stageConfig(stage));
+        if (!routineId) throw unprocessable("Pipeline stage does not have automation configured", { code: "stage_automation_required" });
+        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routineId} and ${routines.companyId} = ${input.companyId} for update`);
         const locked = await txDb
           .select()
           .from(routines)
@@ -3982,6 +4050,11 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           });
         }
 
+        const normalizedEnv = input.env === null ? null
+          : await secretService(txDb).normalizeEnvBindingsForPersistence(input.companyId, input.env, {
+              strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
+              fieldPath: "env",
+            }) as Record<string, EnvBinding>;
         const [routineWithEnv] = await txDb
           .update(routines)
           .set({
@@ -4032,83 +4105,62 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       return derivedStageAutomationPayload(updatedRoutine);
     },
 
-    async deleteStage(input: {
-      companyId: string;
-      pipelineId: string;
-      stageId: string;
-      moveCasesToStageId?: string | null;
-      actor?: PipelineActor;
-    }) {
-      return db.transaction(async (tx) => {
-        await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
-        const stage = await getStageOrThrow(tx, input.pipelineId, input.stageId);
-        const targetStage = input.moveCasesToStageId
-          ? await getStageOrThrow(tx, input.pipelineId, input.moveCasesToStageId)
-          : null;
-        const casesInStage = await tx
-          .select()
-          .from(pipelineCases)
-          .where(and(eq(pipelineCases.pipelineId, input.pipelineId), eq(pipelineCases.stageId, stage.id)));
-        if (casesInStage.length > 0 && !targetStage) {
-          throw unprocessable("Cannot delete a stage that holds cases without moveCasesToStageId", { code: "stage_has_cases" });
-        }
-        if (targetStage) {
-          const movedCases = await tx
-            .update(pipelineCases)
-            .set({
-              stageId: targetStage.id,
-              version: sql`${pipelineCases.version} + 1`,
-              terminalKind: terminalKindForStage(targetStage.kind),
-              terminalAt: isTerminalKind(targetStage.kind) ? nowDate() : null,
-              updatedAt: nowDate(),
-            })
-            .where(and(eq(pipelineCases.pipelineId, input.pipelineId), eq(pipelineCases.stageId, stage.id)))
-            .returning();
-          for (const movedCase of movedCases) {
-            const previous = casesInStage.find((row) => row.id === movedCase.id);
-            const wasTerminal = isTerminalKind(previous?.terminalKind);
-            const isTerminal = isTerminalKind(movedCase.terminalKind);
-            if (previous?.parentCaseId && wasTerminal !== isTerminal) {
-              await adjustParentCounts(tx, {
-                parentCaseId: previous.parentCaseId,
-                terminalChildDelta: isTerminal ? 1 : -1,
-              });
-            }
-            await writeCaseEvent(tx, {
+    async deleteStage(input: PipelineStageDeletionInput) {
+      if (is(db, PgTransaction)) {
+        throw conflict("Pipeline stage deletion requires a root Db", { code: "root_database_required" });
+      }
+      const postCommitPublications: ActivityPublication[] = [];
+      const { result, publication } = await db.transaction((tx) => deletePipelineStageInTransaction(tx, input, {
+        async afterCaseMoved(tx, { previous, current: movedCase, stage, targetStage }) {
+          const wasTerminal = isTerminalKind(previous?.terminalKind);
+          const isTerminal = isTerminalKind(movedCase.terminalKind);
+          if (previous?.parentCaseId && wasTerminal !== isTerminal) {
+            await adjustParentCounts(tx, {
               companyId: input.companyId,
-              caseId: movedCase.id,
-              type: "transitioned",
-              actor: input.actor ?? { type: "system" },
-              fromStageId: stage.id,
-              toStageId: targetStage.id,
-              payload: {
-                reason: "stage_deleted",
-                previousVersion: previous?.version ?? movedCase.version - 1,
-                version: movedCase.version,
-              },
+              parentCaseId: previous.parentCaseId,
+              terminalChildDelta: isTerminal ? 1 : -1,
             });
-            if (!wasTerminal && movedCase.terminalKind === "done") {
-              await handleBlockersResolved(tx, input.companyId, movedCase.id);
-            }
-            if (!wasTerminal && isTerminal) {
-              await handleChildrenTerminal(tx, input.companyId, previous?.parentCaseId);
-            }
           }
-        }
-        await tx.delete(pipelineTransitions).where(or(eq(pipelineTransitions.fromStageId, stage.id), eq(pipelineTransitions.toStageId, stage.id)));
-        await tx.delete(pipelineStages).where(eq(pipelineStages.id, stage.id));
-        const routineId = stageAutomationRoutineIdFromConfig(stageConfig(stage));
-        if (routineId) {
-          await clearPipelineAutomationRoutineIfUnreferenced(tx, {
+          await writeCaseEvent(tx, {
             companyId: input.companyId,
-            pipelineId: input.pipelineId,
-            routineId,
-            exceptStageId: stage.id,
+            caseId: movedCase.id,
+            type: "transitioned",
             actor: input.actor ?? { type: "system" },
+            fromStageId: stage.id,
+            toStageId: targetStage.id,
+            payload: {
+              reason: "stage_deleted",
+              previousVersion: previous?.version ?? movedCase.version - 1,
+              version: movedCase.version,
+            },
           });
-        }
-        return { deleted: true };
-      });
+          if (!wasTerminal && movedCase.terminalKind === "done") {
+            await handleBlockersResolved(tx, input.companyId, movedCase.id);
+          }
+          if (!wasTerminal && isTerminal) {
+            await handleChildrenTerminal(tx, input.companyId, previous?.parentCaseId);
+          }
+        },
+        async afterStageDeleted(tx, stage) {
+          const routineId = stageAutomationRoutineIdFromConfig(stageConfig(stage));
+          if (routineId) {
+            const [routine] = await withPipelineRelationLock(() => tx.select({ id: routines.id }).from(routines)
+              .where(and(eq(routines.companyId, input.companyId), eq(routines.id, routineId)))
+              .for("no key update", { noWait: true }));
+            if (!routine) throw pipelineRelationScopeError();
+            await clearPipelineAutomationRoutineIfUnreferenced(tx, {
+              companyId: input.companyId,
+              pipelineId: input.pipelineId,
+              routineId,
+              exceptStageId: stage.id,
+              actor: input.actor ?? { type: "system" },
+            }, postCommitPublications);
+          }
+        },
+      }));
+      for (const activity of postCommitPublications) publishPipelineConfigurationActivity(activity);
+      publishPipelineConfigurationActivity(publication);
+      return result;
     },
 
     async createTransition(input: { companyId: string; pipelineId: string; fromStageId: string; toStageId: string; label?: string | null }) {
@@ -4527,8 +4579,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       force?: boolean;
       skipChildrenTerminalGate?: boolean;
     }) {
-      const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, { ...input, automationLedgers }));
+      const { result, automationLedgers } = await commitPipelineAutomationTransaction(db,
+        (tx, automationLedgers) => transitionCaseInTransaction(tx, { ...input, automationLedgers }));
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {
@@ -4540,12 +4592,56 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       return { ...result, automationExecution: { status: "none" } satisfies PipelineAutomationExecutionResult };
     },
 
+    async transitionCaseWithReceipt(input: {
+      companyId: string;
+      caseId: string;
+      actor: AuthorizationActor;
+      request: PipelineOperationTransitionRequest;
+    }): Promise<PipelineOperationReceipt> {
+      const request = Object.freeze(pipelineOperationTransitionRequestSchema.parse(input.request));
+      const companyId = input.companyId.toLowerCase(), caseId = input.caseId.toLowerCase();
+      const mutationActor: PipelineActor = { type: "user", userId: input.actor.userId ?? "" };
+      const committed = await commitPipelineOperation(db, { companyId, caseId, actor: input.actor, request }, async tx => {
+        const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
+        const result = await transitionCaseInTransaction(tx, {
+          companyId, caseId, toStageKey: request.toStageKey, expectedVersion: request.expectedVersion,
+          leaseToken: request.leaseToken, reason: request.reason, force: request.force,
+          suggestionId: request.acceptSuggestionId, actor: mutationActor, automationLedgers,
+        });
+        const [finalCase] = await tx.select({ id: pipelineCases.id, version: pipelineCases.version, stageId: pipelineCases.stageId })
+          .from(pipelineCases).where(and(eq(pipelineCases.id, caseId), eq(pipelineCases.companyId, companyId))).limit(1);
+        if (!finalCase || !Number.isSafeInteger(finalCase.version) || !Number.isSafeInteger(result.case.version)) {
+          throw conflict("Operation Case version is unavailable", { code: "operation_receipt_inconsistent" });
+        }
+        return {
+          result: { automationLedgers: [...automationLedgers] },
+          facts: {
+            companyId, caseId, expectedVersion: String(request.expectedVersion),
+            returnedCase: { id: result.case.id, version: String(result.case.version) },
+            primaryEvent: { companyId: result.event.companyId, caseId: result.event.caseId, eventId: result.event.id },
+            primaryExecutionId: result.automationLedger?.id ?? null,
+            knownExecutions: automationLedgers.map(ledger => ({
+              companyId: ledger.companyId, caseId: ledger.caseId, eventId: ledger.triggeringEventId, executionId: ledger.id,
+            })),
+            rootFinalCase: { id: finalCase.id, version: String(finalCase.version), stageId: finalCase.stageId },
+            complete: false,
+            uncovered: ["recursive_case_mutations", "other_events", "parent_counters", "blockers", "comments", "postcommit_dispatch", "external_effects"],
+          },
+        };
+      });
+      if (committed.kind === "replay") return committed.receipt;
+      // Only the original newly committed branch reaches the existing dispatch outlet.
+      await executeAutomationLedgers(committed.result.automationLedgers, { type: "system" });
+      return committed.receipt;
+    },
+
     async retryAutomation(input: {
       companyId: string;
       caseId: string;
       automationId: string;
       actor: PipelineActor;
     }) {
+      assertPipelineAutomationRoot(db);
       const execution = await db
         .select()
         .from(pipelineAutomationExecutions)
@@ -4581,6 +4677,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       cleanup: PipelineAutomationRetryCleanupOptions;
       actor: PipelineActor;
     }) {
+      assertPipelineAutomationRoot(db);
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const { executeIssuePostCommitActions, issueService } = await import("./issues.js");
       const issueSvc = issueService(db);
@@ -4685,6 +4782,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         }
         for (const [parentCaseId, terminalChildDelta] of terminalDeltasByParent) {
           await adjustParentCounts(tx, {
+            companyId: input.companyId,
             parentCaseId,
             terminalChildDelta,
           });
@@ -4694,19 +4792,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           ? effects.linkedAutomationIssueIds
           : [];
         if (issueIdsToCancel.length > 0) {
-          const cancellableIssues = await tx
+          const cancellableIssues = await withPipelineRelationLock(() => tx
             .select({ id: issues.id })
             .from(issues)
             .where(and(
               eq(issues.companyId, input.companyId),
               inArray(issues.id, issueIdsToCancel),
               ne(issues.status, "done"),
-            ));
+            )).for("update", { noWait: true }));
           for (const issue of cancellableIssues) {
-            await issueSvc.update(
+            const updatedIssue = await issueSvc.update(
               issue.id,
               {
                 status: "cancelled",
+                companyGuard: input.companyId,
                 actorAgentId: input.actor.type === "agent" ? input.actor.agentId : null,
                 actorUserId: input.actor.type === "user" ? input.actor.userId : null,
               },
@@ -4714,6 +4813,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               undefined,
               postCommitIssueActions,
             );
+            if (!updatedIssue) throw pipelineRelationChangedError();
           }
           await tx
             .update(pipelineCaseIssueLinks)
@@ -4815,6 +4915,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       caseId: string;
       actor: PipelineActor;
     }) {
+      assertPipelineAutomationRoot(db);
       const ledger = await db.transaction(async (tx) => {
         const detail = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         const automation = stageAutomation(detail.stage);
@@ -4905,7 +5006,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       reason?: string | null;
       leaseToken?: string | null;
     }) {
-      const result = await db.transaction(async (tx) => {
+      const { result, automationLedgers } = await commitPipelineAutomationTransaction(db, async (tx, automationLedgers) => {
         const { case: existing } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         const suggestion = existing.pendingSuggestion;
         if (!suggestion || suggestion.id !== input.suggestionId) {
@@ -4927,7 +5028,6 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           return { case: updated!, event };
         }
 
-        const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
         const transition = await transitionCaseInTransaction(tx, {
           companyId: input.companyId,
           caseId: input.caseId,
@@ -4950,7 +5050,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         return { ...transition, automationLedgers };
       });
       if ("automationLedgers" in result) {
-        const automationExecutions = await executeAutomationLedgers(result.automationLedgers, { type: "system" });
+        const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
         if (result.automationLedger) {
           return {
             ...result,
@@ -4983,8 +5083,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       leaseToken?: string | null;
       actor: PipelineActor;
     }) {
-      const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction(async (tx) => {
+      const { result, automationLedgers } = await commitPipelineAutomationTransaction(db, async (tx, automationLedgers) => {
         const detail = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         if (detail.stage.kind !== "review") {
           throw unprocessable("Pipeline case is not in a review stage", { code: "validation" });
@@ -5091,16 +5190,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       actor: PipelineActor;
     }) {
       return db.transaction(async (tx) => {
-        await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+        await getCaseWithStageForMutationOrThrow(tx, input.companyId, input.caseId);
+        const previousBlockers = await getBlockerRelationsForMutation(tx, input.companyId, input.caseId, "outgoing", true);
         const blockedByCaseIds = await validateBlockerSet(tx, {
           companyId: input.companyId,
           caseId: input.caseId,
           blockedByCaseIds: input.blockedByCaseIds,
         });
-        await tx.delete(pipelineCaseBlockers).where(and(
+        const deleted = await tx.delete(pipelineCaseBlockers).where(and(
           eq(pipelineCaseBlockers.companyId, input.companyId),
           eq(pipelineCaseBlockers.caseId, input.caseId),
-        ));
+        )).returning({ id: pipelineCaseBlockers.id });
+        if (deleted.map((row) => row.id).sort().join() !== previousBlockers.map(({ relation }) => relation.id).sort().join()) {
+          throw pipelineRelationChangedError();
+        }
         if (blockedByCaseIds.length > 0) {
           await tx.insert(pipelineCaseBlockers).values(blockedByCaseIds.map((blockedByCaseId) => ({
             companyId: input.companyId,

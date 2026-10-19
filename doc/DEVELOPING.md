@@ -107,6 +107,32 @@ This starts:
 
 `pnpm dev:once` auto-applies pending local migrations by default before starting the dev server.
 
+### Optional core migration inspection
+
+`PAPERCLIP_CORE_MIGRATION_MODE` defaults to `legacy`. An explicit process value
+`inspect_only` disables core migration application, journal repair and the
+covered database bootstrap/create/reset helpers. It requires an existing external
+PostgreSQL target in process `DATABASE_URL`; `DATABASE_MIGRATION_URL`, when set,
+must match that URL byte for byte. Different credential URLs and aliases are not
+inferred to share a database in this mode. Legacy target resolution is unchanged.
+
+The policy is captured before config bootstrap. Inspection mode skips implicit
+`.env`/worktree repair, never starts embedded PostgreSQL, rejects pending migrations,
+and prevents dev-runner restart options from overriding the policy. An existing
+runner is refused in inspection mode because its policy/target cannot be attested;
+it is not stopped, adopted or re-keyed automatically. Discovery is observational,
+with bounded OS queries; stale registry entries and unknown observations are
+refused. Strict dev-runner does not publish, touch or remove the shared service
+registry, so registry-based management of that runner is unavailable in this mode.
+These observations are not atomic ownership or port reservations. Policy or
+connection changes are rejected; the controls cannot be enabled later by `.env`.
+Migration status labels its result as limited migration-history observation.
+This does not attest schema definitions, database identity or execution eligibility.
+Plugin migrations, business SQL and other server startup/background effects remain
+outside this core policy. The current implementation has source/static review;
+this documentation does not claim live mode or fault-branch qualification.
+
+
 `pnpm dev` and `pnpm dev:once` are now idempotent for the current repo and instance: if the matching Paperclip dev runner is already alive, Paperclip reports the existing process instead of starting a duplicate.
 
 To run against a separate local state root, pass `--data-dir`. The dev runner

@@ -14,13 +14,13 @@ export const checkReference = z.object({
   check_id: boundedText(120), revision: fixedRevision, validator_sha256: digest,
 }).strict();
 export const targetKind = z.enum(["artifact", "artifact_set", "source", "claim"]);
-const descriptor = z.object({
+export const checkDescriptorSchema = z.object({
   check: checkReference,
   target_kinds: z.array(targetKind).min(1).max(4),
   evidence_mode: z.enum(["machine", "authenticated_human"]),
 }).strict();
 export type RequiredCheck = z.infer<typeof checkReference>;
-export type CheckDescriptor = z.infer<typeof descriptor>;
+export type CheckDescriptor = z.infer<typeof checkDescriptorSchema>;
 export type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
 
 export class CheckPreparationError extends Error {
@@ -91,7 +91,7 @@ export function createOfflineCheckRegistry(entries: readonly {
   }
   const catalog = new Map<string, DeepReadonly<CheckDescriptor>>();
   for (const entry of entries) {
-    const spec = parsePreparation(descriptor, entry.descriptor);
+    const spec = parsePreparation(checkDescriptorSchema, entry.descriptor);
     if (!(entry.validatorBytes instanceof Uint8Array) || entry.validatorBytes.byteLength === 0 ||
         entry.validatorBytes.byteLength > 1024 * 1024) throw new CheckPreparationError("invalid_input");
     if (sha256(Buffer.from(entry.validatorBytes)) !== spec.check.validator_sha256) {

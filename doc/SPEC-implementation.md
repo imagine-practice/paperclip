@@ -1696,6 +1696,15 @@ is required.
 - `pnpm db:migrate` applies pending migrations manually
 - no destructive migration in-place for V1 upgrade path
 
+An optional process-only `PAPERCLIP_CORE_MIGRATION_MODE=inspect_only` keeps the
+core migration path observational. It freezes an explicit external `DATABASE_URL`,
+requires any migration URL to be identical, rejects pending history and all covered
+migration/bootstrap/create/reset writes before database work, and cannot be
+superseded by dev-runner auto-apply or restart options. It does not authorize work,
+prove schema definitions, or govern plugin migrations or arbitrary business SQL.
+The default `legacy` mode preserves existing resolution and migration semantics.
+See `DEVELOPING.md` for policy scope and source/static proof limits.
+
 ## 15.3 Logging and Audit
 
 - structured logs (JSON in production)

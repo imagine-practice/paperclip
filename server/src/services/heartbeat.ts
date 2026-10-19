@@ -114,6 +114,7 @@ export {
   resolveNextSessionState,
 } from "./heartbeat/run-state.js";
 
+import { assertExecutionTestDispatch } from "./onisall/execution-test-policy.js";
 import {
   ConfigurationIncompleteFailure,
   deriveTaskKey,
@@ -2737,6 +2738,7 @@ export function heartbeatService(
         // Recheck after workspace/credential preparation, immediately before the
         // provider handoff. Never hold validation locks while adapter code runs.
         await authorizeFailedChatRetryExecution();
+        await assertExecutionTestDispatch(db, agent, run, runtimeConfig);
         if (
           !(await withChatControlRecoveryGate(
             run,

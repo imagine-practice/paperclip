@@ -32,6 +32,13 @@ function baselineView(row: Row): OnisallPreparationBaseline {
     workflowHash: row.workflowHash, baselineHash: row.baselineHash, purpose: "preparation",
     executionAdmission: "not_granted", createdAt: row.createdAt.toISOString() };
 }
+export async function readPreparationBaselineInTransaction(tx: Tx, companyId: string, intakeId: string,
+  baselineId: string, actor: AuthorizationActor) {
+  const [row] = await tx.select().from(baselines).where(and(eq(baselines.companyId, companyId), eq(baselines.intakeId, intakeId), eq(baselines.id, baselineId)));
+  if (!row) throw notFound("Preparation baseline not found");
+  await assertBindingProjectVisible(tx, companyId, row.projectId, actor);
+  return baselineView(row);
+}
 /** Caller verifies source bytes and authorization in this DB snapshot. */
 export async function createPreparationBaselineInTransaction(tx: Tx, preparation: OnisallPreparationStatus,
   actor: AuthorizationActor, userId: string, requestKey: string) {

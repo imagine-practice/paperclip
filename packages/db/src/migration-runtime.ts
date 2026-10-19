@@ -1,3 +1,4 @@
+import { assertStartupMigrationEnvironment, coreMigrationMode, inspectOnlyMigrationConnection } from "./startup-migration-policy.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
@@ -183,6 +184,10 @@ async function ensureEmbeddedPostgresConnection(
 }
 
 export async function resolveMigrationConnection(): Promise<MigrationConnection> {
+  assertStartupMigrationEnvironment();
+  if (coreMigrationMode === "inspect_only") {
+    return { ...inspectOnlyMigrationConnection(), stop: async () => {} };
+  }
   const target = resolveDatabaseTarget();
   if (target.mode === "postgres") {
     return {

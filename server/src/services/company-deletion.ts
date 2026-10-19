@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { createAgentLifecycle, scheduleAgentLifecycle } from "./agent-lifecycle.js";
 import { agentLifecycleCompanyDeletion } from "../modules/agent-lifecycle/company-deletion.js";
 import {
@@ -39,9 +39,15 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  onisallContractPreparations,
+  onisallFrozenRuleSetMembers,
+  onisallFrozenRuleSets,
+  onisallRuleVersions,
   onisallFrozenSchemaSetMembers,
   onisallFrozenSchemaSets,
   onisallSchemaVersions,
+  pipelineOperationReceipts,
+  lockPipelineOperationCompanyLifecycle,
   onisallPreparationBaselines,
   onisallNativeBindings,
   onisallInputObservations,
@@ -63,6 +69,11 @@ export async function deleteCompany(db: Db, id: string) {
         const [existing] = await tx.select({ id: companies.id }).from(companies)
           .where(eq(companies.id, id)).for("no key update");
         if (!existing) return null;
+        // Local B1 lifecycle coordination, before any child lock/cleanup. B1
+        // uses try-shared after KEY SHARE, so it never queues while blocking DELETE.
+        await lockPipelineOperationCompanyLifecycle(tx, existing.id);
+        await tx.execute(sql`select set_config('paperclip.pipeline_receipt_company_cleanup', ${existing.id}, true)`);
+        await tx.delete(pipelineOperationReceipts).where(eq(pipelineOperationReceipts.companyId, id));
         // Finance can reference costs and both can reference runs. Incidents
         // reference policies and approvals; delete these dependents first.
         await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
@@ -107,6 +118,10 @@ export async function deleteCompany(db: Db, id: string) {
         await tx.delete(issues).where(eq(issues.companyId, id));
         // OnisAll children use NO ACTION composite foreign keys. Remove them
         // before the native project/company parents in the same transaction.
+        await tx.delete(onisallContractPreparations).where(eq(onisallContractPreparations.companyId, id));
+        await tx.delete(onisallFrozenRuleSetMembers).where(eq(onisallFrozenRuleSetMembers.companyId, id));
+        await tx.delete(onisallFrozenRuleSets).where(eq(onisallFrozenRuleSets.companyId, id));
+        await tx.delete(onisallRuleVersions).where(eq(onisallRuleVersions.companyId, id));
         await tx.delete(onisallFrozenSchemaSetMembers).where(eq(onisallFrozenSchemaSetMembers.companyId, id));
         await tx.delete(onisallFrozenSchemaSets).where(eq(onisallFrozenSchemaSets.companyId, id));
         await tx.delete(onisallSchemaVersions).where(eq(onisallSchemaVersions.companyId, id));

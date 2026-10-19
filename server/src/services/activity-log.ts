@@ -14,6 +14,10 @@ import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
+type ActivityTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+/** Query builders only: audit persistence never owns a root transaction. */
+export type ActivityDb = Pick<Db | ActivityTransaction, "select" | "insert" | "update">;
+
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
   issue_comment_added: "issue.comment.created",
@@ -70,7 +74,7 @@ export interface LogActivityInput {
 }
 
 
-export async function createActivityDetailsRedactor(db: Db) {
+export async function createActivityDetailsRedactor(db: ActivityDb) {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
   };
@@ -79,7 +83,7 @@ export async function createActivityDetailsRedactor(db: Db) {
   );
 }
 
-export async function redactActivityDetails(db: Db, details: Record<string, unknown> | null) {
+export async function redactActivityDetails(db: ActivityDb, details: Record<string, unknown> | null) {
   if (!details) return null;
   return (await createActivityDetailsRedactor(db))(details);
 }
@@ -88,7 +92,7 @@ function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
+export async function resolveResponsibleUserIdForActivity(db: ActivityDb, input: LogActivityInput) {
   if (input.responsibleUserIdOverride !== undefined) {
     return readNonEmptyString(input.responsibleUserIdOverride);
   }
@@ -161,7 +165,7 @@ export function publishActivity(publication: ActivityPublication) {
   } finally { finish(); }
 }
 
-export async function persistActivity(db: Db, input: LogActivityInput) {
+export async function persistActivity(db: ActivityDb, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
   const [activity] = await db.insert(activityLog).values({
@@ -220,7 +224,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
 }
 
 export async function logActivity(
-  db: Db,
+  db: ActivityDb,
   input: LogActivityInput,
   postCommitPublications?: ActivityPublication[],
 ) {

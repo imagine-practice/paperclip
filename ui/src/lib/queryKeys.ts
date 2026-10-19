@@ -1,4 +1,12 @@
 export const queryKeys = {
+  onisall: {
+    intake: (companyId: string, id: string) => ["onisall", companyId, id] as const,
+    draft: (companyId: string, id: string) => ["onisall", companyId, id, "draft"] as const,
+    preparation: (companyId: string, id: string) => ["onisall", companyId, id, "preparation"] as const,
+    native: (companyId: string, id: string) => ["onisall", companyId, id, "native"] as const,
+    baseline: (companyId: string, id: string, baselineId: string) => ["onisall", companyId, id, "baseline", baselineId] as const,
+    schemaSet: (companyId: string, id: string) => ["onisall-schema-set", companyId, id] as const,
+  },
   skillSources: {
     projects: (companyId: string) => ['project-skill-repositories', companyId] as const,
     preview: (companyId: string, repositoryUrl: string, connectionId: string | null, commitSha: string | null, skillPath: string, filePath: string) => ['skill-sources', companyId, 'preview', repositoryUrl, connectionId, commitSha, skillPath, filePath] as const,

@@ -19,6 +19,9 @@ import {
 } from "./components/UnprefixedExecutionWorkspaceRedirect";
 import { useHiddenSettings } from "./hooks/useHiddenSettings";
 import { Cases } from "./pages/Cases";
+import { OnisallPreparation } from "./pages/OnisallPreparation";
+import { OnisallExecution } from "./pages/OnisallExecution";
+import { OnisallRules } from "./pages/OnisallRules";
 import { CaseDetail } from "./pages/CaseDetail";
 import { OnboardingWizardVariant } from "./components/OnboardingWizardVariant";
 import { CloudAccessGate } from "./components/CloudAccessGate";
@@ -162,6 +165,11 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       />
       <Route path="onboarding" element={<OnboardingRoutePage />} />
       <Route path="companies" element={<Companies />} />
+      <Route path="onisall/intakes" element={<PipelinesExperimentalGate><OnisallPreparation /></PipelinesExperimentalGate>} />
+      <Route path="onisall/intakes/:intakeId" element={<PipelinesExperimentalGate><OnisallPreparation /></PipelinesExperimentalGate>} />
+      <Route path="onisall/execution" element={<PipelinesExperimentalGate><OnisallExecution /></PipelinesExperimentalGate>} />
+      <Route path="onisall/rules" element={<PipelinesExperimentalGate><OnisallRules /></PipelinesExperimentalGate>} />
+      <Route path="onisall/rules/:ruleSetId" element={<PipelinesExperimentalGate><OnisallRules /></PipelinesExperimentalGate>} />
       <Route path="company/settings" element={<CompanySettings />} />
       <Route path="company/settings/connections" element={<CompanyConnections />} />
       <Route path="company/settings/environments" element={<Navigate to="/company/settings/instance/environments" replace />} />
@@ -837,6 +845,11 @@ export function App() {
           <Route path="review-queue" element={<UnprefixedBoardRedirect />} />
           <Route path="learnings" element={<UnprefixedBoardRedirect />} />
           <Route path="cases" element={<UnprefixedBoardRedirect />} />
+          <Route path="onisall/intakes" element={<UnprefixedBoardRedirect />} />
+          <Route path="onisall/intakes/:intakeId" element={<UnprefixedBoardRedirect />} />
+          <Route path="onisall/execution" element={<UnprefixedBoardRedirect />} />
+          <Route path="onisall/rules" element={<UnprefixedBoardRedirect />} />
+          <Route path="onisall/rules/:ruleSetId" element={<UnprefixedBoardRedirect />} />
           <Route path="cases/:caseIdentifier" element={<UnprefixedBoardRedirect />} />
           <Route path="status" element={<UnprefixedBoardRedirect />} />
           <Route path="status/:cardId" element={<UnprefixedBoardRedirect />} />

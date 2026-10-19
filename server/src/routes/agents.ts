@@ -6073,6 +6073,11 @@ export function agentRoutes(
     }>;
     const contextSnapshot: Record<string, unknown> = {
       triggeredBy: req.actor.type,
+      ...(agent.metadata && "onisallExecutionTest" in agent.metadata ? {
+        onisallDirectBoard: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+        onisallBoardSource: req.actor.source,
+        onisallInstanceAdmin: req.actor.isInstanceAdmin === true,
+      } : {}),
       originIdentityContextId: req.actor.identityContextId ?? null,
       responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
       actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,

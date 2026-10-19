@@ -20,6 +20,21 @@ export const RENAMED_FORK_MIGRATIONS = [
     newName: "0358_onisall_schema_sets.sql",
     sha256: "d577349845aa0867715ad31949207278c914f2aa210bdc9e1fbff5d7b5a0739b",
   },
+  {
+    previousNames: ["0324_onisall_rule_sets.sql"],
+    newName: "0359_onisall_rule_sets.sql",
+    sha256: "e57fa5e114c2ed7b18b1c09fb07ff7b7ff5d1108303668f1dcdf9b0a6b0c48ca",
+  },
+  {
+    previousNames: ["0325_onisall_contract_preparations.sql"],
+    newName: "0360_onisall_contract_preparations.sql",
+    sha256: "a6f798c71952b53276b99998609d30d0296ebb3940c018f8e76c4378c6e11f21",
+  },
+  {
+    previousNames: ["0326_lethal_martin_li.sql"],
+    newName: "0361_lethal_martin_li.sql",
+    sha256: "7d4db7c5e1f6f8967fce491adf9872b17509a112c0e89c62bdf08fd9a9efeece",
+  },
 ] as const;
 
 const HISTORY_ERROR = "Renamed fork migration history is ambiguous or incompatible.";

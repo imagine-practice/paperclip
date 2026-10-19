@@ -30,6 +30,7 @@ export const onisallPreparationBaselines = pgTable("onisall_preparation_baseline
   createdByUserId: text("created_by_user_id").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, t => ({
+  scopeUq: unique("onisall_preparation_baselines_scope_uq").on(t.companyId, t.intakeId, t.id),
   requestUq: unique("onisall_preparation_baselines_request_uq").on(t.companyId, t.intakeId, t.requestKey),
   bindingFk: foreignKey({ name: "onisall_preparation_baselines_binding_fk", columns: [t.companyId, t.intakeId, t.bindingId],
     foreignColumns: [onisallNativeBindings.companyId, onisallNativeBindings.intakeId, onisallNativeBindings.id] }),

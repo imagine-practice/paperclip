@@ -1,4 +1,5 @@
 export * from "./slack-app-manifest.js";
+export * from "./pipeline-operation-receipt.js";
 export { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSchema, composioAppAccountSchema, type ComposioAppSetupInput, type ComposioAppSetupResult, type ComposioAppAccountInput, type ComposioAppAccount, type ComposioAppSnapshot, type ComposioAppSyncState, type ComposioAppsResponse } from "./composio-app-setup.js";
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
@@ -240,6 +241,7 @@ export type {
 export { DECISION_TRAINING_RETENTION_POLICY } from "./types/decision-training.js";
 
 export type {
+  PipelineAutomationReconciliation,
   PipelineAutomationRetryBlocker,
   PipelineAutomationRetryCleanupOptions,
   PipelineAutomationRetryEffectCounts,
@@ -2892,3 +2894,6 @@ export * from "./fast-response.js";
 export { HUMAN_TASK_ORIGIN_KINDS, isAgentCreatedIssue, type IssueCreationSourceFields } from "./issue-creation-source.js";
 
 export * from "./grok-bot.js";
+export * from "./onisall-execution-tests.js";
+export * from "./onisall-rule-sets.js";
+export * from "./onisall-contract-preparations.js";

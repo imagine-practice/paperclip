@@ -137,7 +137,7 @@ describe("assertForkMigrationFallbackSafe", () => {
     expect(() => assertForkMigrationFallbackSafe(availableMigrations, [], history)).toThrow(FALLBACK_ERROR);
   });
 
-  it.each(["0320_daily_onslaught.sql", "0320_onisall_intake_drafts.sql", "0347_onisall_intake_drafts.sql", "0350_onisall_schema_sets.sql", "0355_onisall_intake_drafts.sql"])(
+  it.each(["0320_daily_onslaught.sql", "0320_onisall_intake_drafts.sql", "0347_onisall_intake_drafts.sql", "0350_onisall_schema_sets.sql", "0355_onisall_intake_drafts.sql", "0359_onisall_rule_sets.sql"])(
     "rejects a divergent candidate even with a short history: %s", (name) => {
       expect(() => assertForkMigrationFallbackSafe(availableMigrations, [name], { rowCount: 1 })).toThrow(FALLBACK_ERROR);
     },

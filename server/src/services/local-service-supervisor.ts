@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import { isIP } from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -177,6 +178,19 @@ export async function removeLocalServiceRegistryRecord(serviceKey: string) {
 
 export async function readLocalServiceRegistryRecord(serviceKey: string) {
   return await safeReadRegistryRecord(getRuntimeServiceRegistryPath(serviceKey));
+}
+
+/** Conservative observation only: never adopt, repair, remove or touch a record. */
+export async function hasLocalServiceEvidenceReadOnly(input: { serviceKey: string; port: number }): Promise<boolean> {
+  try {
+    await fs.lstat(getRuntimeServiceRegistryPath(input.serviceKey));
+    return true; // Includes stale, malformed and symlink records; no content read.
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error("Local service observation unavailable");
+    }
+  }
+  return (await readLocalServicePortOwner(input.port, { failClosed: true })) !== null;
 }
 
 export async function listLocalServiceRegistryRecords(filter?: {
@@ -604,14 +618,64 @@ export async function terminateLocalService(
   throw new Error(`Failed to terminate local service ${target}${listener}`);
 }
 
-export async function readLocalServicePortOwner(port: number) {
-  if (!Number.isInteger(port) || port <= 0) return null;
+export async function readLocalServicePortOwner(port: number, options: { failClosed?: boolean } = {}) {
+  if (!Number.isInteger(port) || port <= 0 || (options.failClosed && port > 65535)) {
+    if (options.failClosed) throw new Error("Local service observation unavailable");
+    return null;
+  }
   try {
     if (process.platform === "win32") {
-      const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "tcp"]);
+      const { stdout, stderr } = await execFileAsync("netstat", ["-ano", "-p", "tcp"],
+        options.failClosed ? { timeout: 5000, maxBuffer: 256 * 1024 } : {});
+      if (options.failClosed && stderr.trim()) throw new Error("Local service observation unavailable");
+      let hasHeader = false;
+      let strictOwner: number | null = null;
       for (const line of stdout.split(/\r?\n/)) {
+        if (/\bProto\b/.test(line) && /\bPID\b/.test(line)) {
+          if (options.failClosed && (hasHeader || !/^Proto\s+Local\s+Address\s+Foreign\s+Address\s+State\s+PID$/i.test(line.trim()))) {
+            throw new Error("Local service observation unavailable");
+          }
+          hasHeader = true;
+          continue;
+        }
         const columns = line.trim().split(/\s+/);
+        if (options.failClosed && line.trim() && columns[0]?.toUpperCase() !== "TCP"
+          && line.trim().toLowerCase() !== "active connections") {
+          throw new Error("Local service observation unavailable");
+        }
+        if (options.failClosed && columns[0]?.toUpperCase() === "TCP" && columns.length !== 5) {
+          throw new Error("Local service observation unavailable");
+        }
         if (columns.length < 5 || columns[0]?.toUpperCase() !== "TCP") continue;
+        if (options.failClosed) {
+          // Validate every row before reporting absence, including other ports.
+          const endpointPort = (endpoint: string, allowZero: boolean) => {
+            const match = /^(?:([^:\s]+)|\[([^\]\s]+)\]):(\d+)$/.exec(endpoint);
+            if (!match) throw new Error("Local service observation unavailable");
+            const host = match[1] ?? match[2]!;
+            const address = host.replace(/%\d+$/, "");
+            const family = isIP(address);
+            const value = Number(match[3]);
+            if ((match[1] ? family !== 4 : family !== 6) || (family === 4 && host !== address)
+              || !Number.isSafeInteger(value) || value < (allowZero ? 0 : 1) || value > 65535) {
+              throw new Error("Local service observation unavailable");
+            }
+            return value;
+          };
+          const localPort = endpointPort(columns[1]!, false);
+          endpointPort(columns[2]!, true);
+          const state = columns[3]!.toUpperCase();
+          const pidToken = columns[4]!;
+          const pid = Number(pidToken);
+          if (!hasHeader || !/^\d+$/.test(pidToken) || !Number.isSafeInteger(pid) || pid < 0
+            || (state === "LISTENING" && pid === 0)
+            || !["LISTENING", "ESTABLISHED", "TIME_WAIT", "CLOSE_WAIT", "FIN_WAIT_1", "FIN_WAIT_2",
+              "LAST_ACK", "SYN_SENT", "SYN_RECEIVED", "CLOSING", "DELETE_TCB", "CLOSED", "BOUND"].includes(state)) {
+            throw new Error("Local service observation unavailable");
+          }
+          if (localPort === port && state === "LISTENING") strictOwner ??= pid;
+          continue;
+        }
         const localAddress = columns[1] ?? "";
         const separatorIndex = localAddress.lastIndexOf(":");
         const localPort = Number.parseInt(localAddress.slice(separatorIndex + 1), 10);
@@ -621,15 +685,33 @@ export async function readLocalServicePortOwner(port: number) {
           return pid;
         }
       }
-      return null;
+      if (options.failClosed && !hasHeader) throw new Error("Local service observation unavailable");
+      return options.failClosed ? strictOwner : null;
     }
-    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+    const { stdout, stderr } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"],
+      options.failClosed ? { timeout: 5000, maxBuffer: 256 * 1024 } : {});
+    if (options.failClosed && stderr.trim()) throw new Error("Local service observation unavailable");
+    if (options.failClosed) {
+      const lines = stdout.trim().split(/\r?\n/);
+      if (!stdout.trim() || lines.some((line) => !/^[1-9]\d*$/.test(line)
+        || !Number.isSafeInteger(Number(line)))) {
+        throw new Error("Local service observation unavailable");
+      }
+      return Number(lines[0]);
+    }
     const firstPid = stdout
       .split("\n")
       .map((line) => Number.parseInt(line.trim(), 10))
       .find((value) => Number.isInteger(value) && value > 0);
     return firstPid ?? null;
-  } catch {
+  } catch (error) {
+    if (options.failClosed) {
+      const result = error as { code?: number; signal?: string | null; killed?: boolean; stdout?: string; stderr?: string };
+      // lsof reports an empty selection with exit 1. Other failures stay unknown.
+      if (process.platform !== "win32" && result.code === 1 && !result.signal && !result.killed
+        && result.stdout === "" && result.stderr === "") return null;
+      throw new Error("Local service observation unavailable");
+    }
     return null;
   }
 }

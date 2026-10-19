@@ -43,6 +43,7 @@ import {
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
+import { executionTestPolicy, assertExecutionTestRequest, admitExecutionTest } from "../onisall/execution-test-policy.js";
 import {
   slackMentionAllowsRunStart,
   assertDurableChatWakeupReceipt,
@@ -2123,6 +2124,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    // Native completion/recovery may request follow-up work. This profile is
+    // manual-only: suppress that wake normally so native teardown can finish.
+    if (executionTestPolicy(agent) && !opts.manualUserWake) return null;
+    assertExecutionTestRequest(agent, issueId, opts);
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
@@ -2683,6 +2688,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          await admitExecutionTest(tx, agent, issueId, opts);
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
