@@ -15,6 +15,15 @@ export {
   type Db,
 } from "./client.js";
 export {
+  withCompanyWorkflowTransaction,
+  companyWorkflowDb,
+  CompanyWorkflowError,
+  type CompanyWorkflowContext,
+  type CompanyWorkflowDb,
+  type CompanyWorkflowPurpose,
+  type CompanyWorkflowErrorCode,
+} from "./company-workflow-transaction.js";
+export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
@@ -42,3 +51,4 @@ export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecy
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";
+export { tryPipelineOperationCompanyLifecycle, lockPipelineOperationCompanyLifecycle, lockPipelineOperationKey } from "./pipeline-operation-locks.js";

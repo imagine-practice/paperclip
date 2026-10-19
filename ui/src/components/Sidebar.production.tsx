@@ -186,7 +186,7 @@ export function Sidebar() {
           ) : null}
           <SidebarNavItem to="/routines" label="Routines" icon={Repeat} />
           {showPipelines ? (
-            <SidebarNavItem to="/pipelines" label="Pipelines" icon={GitBranch} />
+            <><SidebarNavItem to="/pipelines" label="Pipelines" icon={GitBranch} /><SidebarNavItem to="/onisall/intakes" label="OnisAll 输入准备" icon={ListChecks} /><SidebarNavItem to="/onisall/execution" label="OnisAll 模型测试" icon={ListChecks} /><SidebarNavItem to="/onisall/rules" label="OnisAll 执行规则" icon={ListChecks} /></>
           ) : null}
           {showGoalsLink ? (
             <SidebarNavItem to="/goals" label="Goals" icon={Target} />

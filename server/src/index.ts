@@ -1,3 +1,4 @@
+import { assertMigrationInspectionConnection, assertStartupMigrationEnvironment, closedStartupMigrationError, coreMigrationMode, StartupMigrationPolicyError } from "@paperclipai/db/startup-migration-policy";
 import { isIdleTaskDrainActive, beginIdleTrackedWork, trackIdleWork } from "./services/task-admission.js";
 import { markIdleStartupComplete } from "./services/idle-local-work.js";
 import { clearIdleBackupWakeRequired, idleBackupWakeMarker, markIdleBackupWakeRequired, verifyIdleDatabaseBackup } from "./services/idle-database-backup.js";
@@ -210,6 +211,7 @@ export async function startServer(): Promise<StartedServer> {
 async function startServerWithDatabaseTeardown(
   startupDatabase: StartupDatabaseTeardown,
 ): Promise<StartedServer> {
+  assertStartupMigrationEnvironment();
   setStartupRecoveryPhase("starting");
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
@@ -220,7 +222,17 @@ async function startServerWithDatabaseTeardown(
   // sentry.ts.
   await sentryReady;
   ensureDecisionSigningSecret();
-  let config = loadConfig();
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig();
+    if (coreMigrationMode === "inspect_only") {
+      assertMigrationInspectionConnection(config.databaseUrl ?? "");
+      assertMigrationInspectionConnection(config.databaseMigrationUrl ?? config.databaseUrl ?? "");
+    }
+  } catch (error) {
+    if (coreMigrationMode === "inspect_only") throw closedStartupMigrationError(error, "startup_configuration_unavailable");
+    throw error;
+  }
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
@@ -270,8 +282,13 @@ async function startServerWithDatabaseTeardown(
     label: string,
     opts?: EnsureMigrationsOptions,
   ): Promise<MigrationSummary> {
+    assertStartupMigrationEnvironment();
     const autoApply = opts?.autoApply === true;
     let state = await inspectMigrations(connectionString);
+    if (coreMigrationMode === "inspect_only") {
+      if (state.status !== "upToDate") throw new StartupMigrationPolicyError("migrations_pending");
+      return "already applied";
+    }
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
       const repair = await reconcilePendingMigrationHistory(connectionString);
       if (repair.repairedMigrations.length > 0) {

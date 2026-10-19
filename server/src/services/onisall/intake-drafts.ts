@@ -16,6 +16,8 @@ import { revalidateNativeBindingInTransaction } from "./native-revalidation.js";
 import { createPreparationBaselineInTransaction, preparationBaselineStatusInTransaction } from "./preparation-baselines.js";
 import { accessService } from "../access.js";
 import type { OnisallNativeRevalidation } from "@paperclipai/shared";
+import { is } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 
 type Snapshot = typeof snapshots.$inferSelect;
 type Draft = typeof drafts.$inferSelect;
@@ -49,6 +51,36 @@ function decode(content: string) {
     if (error instanceof InputSnapshotError) throw unprocessable("Invalid input snapshot", { code: error.code });
     throw error;
   }
+}
+
+/** DB-only composition. Caller owns current company authorization/snapshot.
+ * Project visibility is checked before loading any customer bytes. */
+export async function readIntakePreparationInTransaction(tx: Tx, storage: StorageService, companyId: string,
+  id: string, actor: AuthorizationActor) {
+  if (!is(tx, PgTransaction)) throw new Error("Intake preparation read requires a transaction");
+  const [company] = await tx.select().from(companies).where(eq(companies.id, companyId));
+  const [row] = await tx.select().from(drafts).where(scope(companyId, id));
+  if (!company || !row) throw notFound("Intake draft not found");
+  await readIntakeBinding(tx, companyId, id, actor);
+  const [snapshot] = await tx.select().from(snapshots).where(and(eq(snapshots.companyId, companyId), eq(snapshots.id, row.initialSnapshotId)));
+  if (!snapshot) throw conflict("Stored intake snapshot differs");
+  if (snapshot.provider !== storage.provider || snapshot.objectKey !== `${companyId}/onisall-inputs/v1/${snapshot.sha256}.txt`) {
+    throw conflict("Input storage metadata differs");
+  }
+  let bytes: Buffer;
+  try {
+    const object = await storage.getObject(companyId, snapshot.objectKey);
+    const chunks: Buffer[] = []; let size = 0;
+    try { for await (const chunk of object.stream) {
+      const part = Buffer.from(chunk); size += part.length;
+      if (size > MAX_INPUT_BYTES || size > snapshot.byteSize) throw new Error("Input limit exceeded");
+      chunks.push(part);
+    } } finally { object.stream.destroy(); }
+    bytes = Buffer.concat(chunks, size);
+  } catch { throw conflict("Stored input bytes unavailable or differ"); }
+  if (bytes.length !== snapshot.byteSize || sha256(bytes) !== snapshot.sha256) throw conflict("Stored input bytes differ");
+  return { draft: row, companyStatus: company.status,
+    preparation: preparationStatus(await draftView(tx, row, snapshot, actor), bytes, new Date()) };
 }
 
 // Routes authenticate board/company membership. No Agent grants or native work

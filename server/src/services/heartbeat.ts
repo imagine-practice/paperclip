@@ -66,6 +66,7 @@ export {
   resolveNextSessionState,
 } from "./heartbeat/run-state.js";
 import { readGitConnectionFailure } from "./git-connection-failure.js";
+import { executionTestPolicy, assertExecutionTestRequest, admitExecutionTest, assertExecutionTestDispatch } from "./onisall/execution-test-policy.js";
 import {
   CONFIGURATION_INCOMPLETE_FAILURE_CODE,
   ConfigurationIncompleteFailure,
@@ -10811,6 +10812,7 @@ export function heartbeatService(
         // Recheck after workspace/credential preparation, immediately before the
         // provider handoff. Never hold validation locks while adapter code runs.
         await authorizeFailedChatRetryExecution();
+        await assertExecutionTestDispatch(db, agent, run, runtimeConfig);
         if (
           !(await withChatControlRecoveryGate(
             run,
@@ -15058,6 +15060,10 @@ export function heartbeatService(
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    // Native completion/recovery may request follow-up work. This profile is
+    // manual-only: suppress that wake normally so native teardown can finish.
+    if (executionTestPolicy(agent) && !opts.manualUserWake) return null;
+    assertExecutionTestRequest(agent, issueId, opts);
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
@@ -15596,6 +15602,7 @@ export function heartbeatService(
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          await admitExecutionTest(tx, agent, issueId, opts);
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(

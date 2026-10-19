@@ -3,6 +3,37 @@ import type { RoutineEnvConfig } from "./routine.js";
 import type { ExecutionWorkspaceMode, IssueExecutionWorkspaceSettings } from "./workspace-runtime.js";
 import type { SourceTrustMetadata } from "../trust-policy.js";
 
+/** Native observations only; this response never authorizes execution. */
+export interface PipelineAutomationReconciliation {
+  scope: { companyId: string; caseId: string; executionId: string };
+  observation: {
+    startedAt: string;
+    completedAt: string;
+    isolation: "repeatable_read";
+    access: "read_only";
+  };
+  rootEvidence: "native_records_observed" | "unresolved";
+  dispatchEvidence: "linked_records_observed" | "routine_records_observed" | "none_observed" | "contradictory" | "unresolved";
+  coverage: {
+    complete: false;
+    truncated: string[];
+    limitations: string[];
+    contradictions: string[];
+    limits: { collection: number; mergeDepth: number; mergeNodes: number; issues: number; selectConstructions: number; callbackBudgetMs: number; statementBudgetMs: number };
+  };
+  nativeFacts: {
+    ledger: { id: string; status: string; pendingDispatch: boolean; generation: number; createdAt: string; updatedAt: string };
+    triggeringEvent: { id: string; type: string; createdAt: string } | null;
+    routineRuns: Array<{ id: string; status: string; linkedIssueId: string | null; coalescedIntoRunId: string | null; createdAt: string }>;
+    mergedRoutineRuns: Array<{ id: string; status: string; linkedIssueId: string | null; coalescedIntoRunId: string | null; createdAt: string }>;
+    issues: Array<{ id: string; status: string; createdAt: string }>;
+    links: Array<{ id: string; issueId: string; role: string; exactAttempt: boolean; retired: boolean; createdAt: string }>;
+    heartbeatRuns: Array<{ id: string; status: string; issueId: string | null; scopeKind: "company" | "issue"; createdAt: string }>;
+  };
+  executionEligibility: "not_assessed";
+  allowedActions: ["read", "reconcile"];
+}
+
 export type PipelineCaseConversationSourceReason =
   | "producer_update"
   | "producer_create"

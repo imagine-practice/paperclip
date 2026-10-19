@@ -128,6 +128,9 @@ import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { onisallIntakeRoutes } from "./routes/onisall-intakes.js";
 import { onisallSchemaSetRoutes } from "./routes/onisall-schema-sets.js";
+import { onisallExecutionTestRoutes } from "./routes/onisall-execution-tests.js";
+import { onisallRuleSetRoutes } from "./routes/onisall-rule-sets.js";
+import { onisallContractPreparationRoutes } from "./routes/onisall-contract-preparations.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import {
@@ -787,6 +790,9 @@ export async function createApp(
   api.use(assetRoutes(db, opts.storageService));
   api.use(onisallIntakeRoutes(db, opts.storageService));
   api.use(onisallSchemaSetRoutes(db));
+  api.use(onisallExecutionTestRoutes(db));
+  api.use(onisallRuleSetRoutes(db, opts.storageService));
+  api.use(onisallContractPreparationRoutes(db, opts.storageService));
   api.use(agentProfileAvatarRoutes(db, opts.storageService));
   api.use(projectToolRoutes(db));
   api.use(projectRoutes(db));

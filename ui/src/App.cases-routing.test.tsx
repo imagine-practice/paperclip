@@ -63,6 +63,10 @@ vi.mock("./components/OnboardingWizardVariant", () => ({
 // Sentinel pages so we can assert *which* route resolved.
 vi.mock("./pages/Cases", () => ({ Cases: () => <div>CASES_LIST_PAGE</div> }));
 vi.mock("./pages/CaseDetail", () => ({ CaseDetail: () => <div>CASE_DETAIL_PAGE</div> }));
+vi.mock("./pages/OnisallPreparation", () => ({ OnisallPreparation: () => <div>ONISALL_PREPARATION_PAGE</div> }));
+vi.mock("./pages/OnisallExecution", () => ({ OnisallExecution: () => <div>ONISALL_EXECUTION_PAGE</div> }));
+vi.mock("./pages/OnisallRules", () => ({ OnisallRules: () => <div>ONISALL_RULES_PAGE</div> }));
+vi.mock("./components/PipelinesExperimentalGate", () => ({ PipelinesExperimentalGate: ({ children }: { children: ReactNode }) => <>{children}</> }));
 
 // Cloud access is unrelated to the route-table regression. Let it fall through
 // synchronously so this test does not poll its three query transitions.
@@ -127,6 +131,27 @@ describe("App Cases routing (PAP-13002)", () => {
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  it.each(["/onisall/intakes", "/onisall/intakes/00000000-0000-4000-8000-000000000001", "/PAP/onisall/intakes", "/PAP/onisall/intakes/00000000-0000-4000-8000-000000000001?baseline=00000000-0000-4000-8000-000000000002"])("resolves preparation path %s without confusing onisall with a company prefix", async (path) => {
+    const root = await renderAppAt(container, path);
+    await waitForRoute(container, "ONISALL_PREPARATION_PAGE");
+    expect(container.textContent).not.toContain("No organization matches prefix");
+    flushSync(() => root.unmount());
+  });
+
+  it.each(["/onisall/execution", "/PAP/onisall/execution"])("resolves native model test page %s", async (path) => {
+    const root = await renderAppAt(container, path);
+    await waitForRoute(container, "ONISALL_EXECUTION_PAGE");
+    expect(container.textContent).not.toContain("No organization matches prefix");
+    flushSync(() => root.unmount());
+  });
+
+  it.each(["/onisall/rules", "/PAP/onisall/rules", "/onisall/rules/00000000-0000-4000-8000-000000000003", "/PAP/onisall/rules/00000000-0000-4000-8000-000000000003"])("resolves rule catalog and detail %s", async path => {
+    const root = await renderAppAt(container, path);
+    await waitForRoute(container, "ONISALL_RULES_PAGE");
+    expect(container.textContent).not.toContain("No organization matches prefix");
+    flushSync(() => root.unmount());
   });
 
   it("redirects unprefixed /cases to the company-prefixed list page", async () => {

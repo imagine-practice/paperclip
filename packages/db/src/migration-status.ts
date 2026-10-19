@@ -1,3 +1,4 @@
+import { closedStartupMigrationError, coreMigrationMode, requireMigrationInspectionPayload } from "./startup-migration-policy.js";
 import { inspectMigrations } from "./client.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
 
@@ -36,8 +37,11 @@ async function main(): Promise<void> {
             reason: state.reason,
           };
 
+    const observed = coreMigrationMode === "inspect_only"
+      ? requireMigrationInspectionPayload({ ...payload, migrationMode: "inspect_only",
+        proofLevel: "migration_history_only", executionEligibility: "not_assessed" }) : payload;
     if (jsonMode) {
-      console.log(JSON.stringify(payload));
+      console.log(JSON.stringify(observed));
       return;
     }
 
@@ -55,6 +59,10 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
+  if (coreMigrationMode === "inspect_only") {
+    process.stderr.write(`${closedStartupMigrationError(error, "inspection_failed").message}\n`);
+    process.exit(1);
+  }
   const err = toError(error, "Migration status check failed");
   process.stderr.write(`${err.stack ?? err.message}\n`);
   process.exit(1);

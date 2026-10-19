@@ -81,6 +81,7 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { buildRoutineRevisionSnapshot, routineRevisionSnapshotRoutine } from "./routine-revision-snapshot.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -184,7 +185,6 @@ async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorU
 
 type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null };
 type RoutineRow = typeof routines.$inferSelect;
-type RoutineTriggerRow = typeof routineTriggers.$inferSelect;
 
 const ROUTINE_DESCRIPTION_DOCUMENT_KEY = "description" as const;
 
@@ -551,60 +551,6 @@ function readManagedRoutineIssueTemplate(defaultsJson: Record<string, unknown> |
 function routineUsesWorkspaceBranch(routine: typeof routines.$inferSelect) {
   return (routine.variables ?? []).some((variable) => variable.name === WORKSPACE_BRANCH_ROUTINE_VARIABLE)
     || extractRoutineVariableNames([routine.title, routine.description]).includes(WORKSPACE_BRANCH_ROUTINE_VARIABLE);
-}
-
-function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSnapshotV1["routine"] {
-  return {
-    id: routine.id,
-    companyId: routine.companyId,
-    projectId: routine.projectId,
-    goalId: routine.goalId,
-    parentIssueId: routine.parentIssueId,
-    title: routine.title,
-    description: routine.description,
-    assigneeAgentId: routine.assigneeAgentId,
-    priority: routine.priority as RoutineRevisionSnapshotV1["routine"]["priority"],
-    status: routine.status as RoutineRevisionSnapshotV1["routine"]["status"],
-    concurrencyPolicy: routine.concurrencyPolicy as RoutineRevisionSnapshotV1["routine"]["concurrencyPolicy"],
-    catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
-    activityGatePolicy: routine.activityGatePolicy as RoutineRevisionSnapshotV1["routine"]["activityGatePolicy"],
-    activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
-    variables: routine.variables ?? [],
-    env: routine.env ?? null,
-    responsibleUserId: routine.responsibleUserId ?? null,
-  };
-}
-
-function routineRevisionSnapshotTrigger(trigger: RoutineTriggerRow): RoutineRevisionSnapshotV1["triggers"][number] {
-  return {
-    id: trigger.id,
-    setupPending: trigger.setupPending,
-    kind: trigger.kind as RoutineRevisionSnapshotV1["triggers"][number]["kind"],
-    label: trigger.label,
-    enabled: trigger.enabled,
-    cronExpression: trigger.cronExpression,
-    timezone: trigger.timezone,
-    publicId: trigger.publicId,
-    signingMode: trigger.signingMode as RoutineRevisionSnapshotV1["triggers"][number]["signingMode"],
-    replayWindowSec: trigger.replayWindowSec,
-  };
-}
-
-async function buildRoutineRevisionSnapshot(
-  executor: Db,
-  routine: RoutineRow,
-): Promise<RoutineRevisionSnapshotV1> {
-  const triggers = await executor
-    .select()
-    .from(routineTriggers)
-    .where(and(eq(routineTriggers.companyId, routine.companyId), eq(routineTriggers.routineId, routine.id), eq(routineTriggers.archived, false)))
-    .orderBy(asc(routineTriggers.createdAt), asc(routineTriggers.id));
-
-  return {
-    version: 1,
-    routine: routineRevisionSnapshotRoutine(routine),
-    triggers: triggers.map(routineRevisionSnapshotTrigger),
-  };
 }
 
 function canonicalSnapshot(value: RoutineRevisionSnapshotV1) {
@@ -1021,9 +967,9 @@ export function routineService(
     }
   }
 
-  async function assertProject(companyId: string, projectId: string | null | undefined) {
+  async function assertProject(companyId: string, projectId: string | null | undefined, executor: Db = db) {
     if (!projectId) return;
-    const project = await db
+    const project = await executor
       .select({ id: projects.id, companyId: projects.companyId })
       .from(projects)
       .where(eq(projects.id, projectId))
@@ -1032,8 +978,8 @@ export function routineService(
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
   }
 
-  async function assertGoal(companyId: string, goalId: string) {
-    const goal = await db
+  async function assertGoal(companyId: string, goalId: string, executor: Db = db) {
+    const goal = await executor
       .select({ id: goals.id, companyId: goals.companyId })
       .from(goals)
       .where(eq(goals.id, goalId))
@@ -1042,8 +988,8 @@ export function routineService(
     if (goal.companyId !== companyId) throw unprocessable("Goal must belong to same company");
   }
 
-  async function assertParentIssue(companyId: string, issueId: string) {
-    const parentIssue = await db
+  async function assertParentIssue(companyId: string, issueId: string, executor: Db = db) {
+    const parentIssue = await executor
       .select({ id: issues.id, companyId: issues.companyId })
       .from(issues)
       .where(eq(issues.id, issueId))
@@ -1052,9 +998,9 @@ export function routineService(
     if (parentIssue.companyId !== companyId) throw unprocessable("Parent issue must belong to same company");
   }
 
-  async function assertRoutineFolder(companyId: string, folderId: string | null | undefined) {
+  async function assertRoutineFolder(companyId: string, folderId: string | null | undefined, executor: Db = db) {
     if (!folderId) return;
-    const folder = await db
+    const folder = await executor
       .select({ id: folders.id, kind: folders.kind })
       .from(folders)
       .where(and(eq(folders.companyId, companyId), eq(folders.id, folderId)))
@@ -2275,70 +2221,13 @@ export function routineService(
     update: async (id: string, patch: UpdateRoutine, actor: Actor): Promise<Routine | null> => {
       const existing = await getRoutineById(id);
       if (!existing) return null;
-      const nextProjectId = patch.projectId === undefined ? existing.projectId : patch.projectId;
-      const nextFolderId = patch.folderId === undefined ? existing.folderId : patch.folderId;
-      const nextAssigneeAgentId = patch.assigneeAgentId === undefined ? existing.assigneeAgentId : patch.assigneeAgentId;
-      const nextTitle = patch.title ?? existing.title;
-      const nextDescription = patch.description === undefined ? existing.description : patch.description;
-      const nextEnv = patch.env === undefined
-        ? existing.env
-        : patch.env === null
-          ? null
-          : await secretsSvc.normalizeEnvBindingsForPersistence(existing.companyId, patch.env, {
-              strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
-              fieldPath: "env",
-            });
-      const requestedStatus = patch.status ?? existing.status;
-      if (patch.status === "active") {
-        assertRoutineCanEnable(patch.status, nextAssigneeAgentId);
-      }
-      const nextStatus = patch.assigneeAgentId === undefined
-        ? requestedStatus
-        : normalizeDraftRoutineStatus(requestedStatus, nextAssigneeAgentId);
-      const nextVariables = syncRoutineVariablesWithTemplate(
-        [nextTitle, nextDescription],
-        patch.variables === undefined ? existing.variables : sanitizeRoutineVariableInputs(patch.variables),
-      );
-      if (patch.projectId !== undefined) await assertProject(existing.companyId, nextProjectId);
-      if (patch.folderId !== undefined) await assertRoutineFolder(existing.companyId, nextFolderId);
-      if (patch.assigneeAgentId !== undefined || patch.status === "active") {
-        await assertAssignableAgent(db, existing.companyId, nextAssigneeAgentId, { kind: "routine" });
-      }
-      if (patch.goalId) await assertGoal(existing.companyId, patch.goalId);
-      if (patch.parentIssueId) await assertParentIssue(existing.companyId, patch.parentIssueId);
-      assertRoutineVariableDefinitions(nextVariables);
-      const enabledScheduleTriggers = await db
-        .select({ id: routineTriggers.id })
-        .from(routineTriggers)
-        .where(
-          and(
-            eq(routineTriggers.routineId, existing.id),
-            eq(routineTriggers.kind, "schedule"),
-            eq(routineTriggers.enabled, true),
-            eq(routineTriggers.archived, false),
-          ),
-        )
-        .limit(1)
-        .then((rows) => rows.length > 0);
-      if (enabledScheduleTriggers) {
-        assertScheduleCompatibleVariables(nextVariables);
-      }
-      const responsibleUserId = await resolveRoutineResponsibleUserId(
-        db,
-        existing.companyId,
-        actor.userId,
-        patch.parentIssueId === undefined ? existing.parentIssueId : patch.parentIssueId,
-      );
-      if (!responsibleUserId) {
-        throw unprocessable("Routine requires a responsible user");
-      }
       const updatedRoutine = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${id} for update`);
+        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${id} and ${routines.companyId} = ${existing.companyId} for update`);
         const locked = await txDb
           .select()
           .from(routines)
-          .where(eq(routines.id, id))
+          .where(and(eq(routines.id, id), eq(routines.companyId, existing.companyId)))
           .then((rows) => rows[0] ?? null);
         if (!locked) return null;
 
@@ -2347,6 +2236,49 @@ export function routineService(
             currentRevisionId: locked.latestRevisionId,
           });
         }
+
+        // The pre-transaction row supplies scope only. Every omitted PATCH
+        // field and every derived template/variable is based on this locked row.
+        const nextProjectId = patch.projectId === undefined ? locked.projectId : patch.projectId;
+        const nextFolderId = patch.folderId === undefined ? locked.folderId : patch.folderId;
+        const nextAssigneeAgentId = patch.assigneeAgentId === undefined ? locked.assigneeAgentId : patch.assigneeAgentId;
+        const nextTitle = patch.title ?? locked.title;
+        const nextDescription = patch.description === undefined ? locked.description : patch.description;
+        const nextEnv = patch.env === undefined
+          ? locked.env
+          : patch.env === null
+            ? null
+            : await secretService(txDb).normalizeEnvBindingsForPersistence(locked.companyId, patch.env, {
+                strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
+                fieldPath: "env",
+              });
+        const requestedStatus = patch.status ?? locked.status;
+        if (patch.status === "active") assertRoutineCanEnable(patch.status, nextAssigneeAgentId);
+        const nextStatus = patch.assigneeAgentId === undefined
+          ? requestedStatus
+          : normalizeDraftRoutineStatus(requestedStatus, nextAssigneeAgentId);
+        const nextVariables = syncRoutineVariablesWithTemplate(
+          [nextTitle, nextDescription],
+          patch.variables === undefined ? locked.variables : sanitizeRoutineVariableInputs(patch.variables),
+        );
+        if (patch.projectId !== undefined) await assertProject(locked.companyId, nextProjectId, txDb);
+        if (patch.folderId !== undefined) await assertRoutineFolder(locked.companyId, nextFolderId, txDb);
+        if (patch.assigneeAgentId !== undefined || patch.status === "active") {
+          await assertAssignableAgent(txDb, locked.companyId, nextAssigneeAgentId, { kind: "routine" });
+        }
+        if (patch.goalId) await assertGoal(locked.companyId, patch.goalId, txDb);
+        if (patch.parentIssueId) await assertParentIssue(locked.companyId, patch.parentIssueId, txDb);
+        assertRoutineVariableDefinitions(nextVariables);
+        const enabledScheduleTriggers = await txDb.select({ id: routineTriggers.id }).from(routineTriggers)
+          .where(and(eq(routineTriggers.companyId, locked.companyId), eq(routineTriggers.routineId, locked.id),
+            eq(routineTriggers.kind, "schedule"), eq(routineTriggers.enabled, true), eq(routineTriggers.archived, false)))
+          .limit(1).then((rows) => rows.length > 0);
+        if (enabledScheduleTriggers) assertScheduleCompatibleVariables(nextVariables);
+        const responsibleUserId = await resolveRoutineResponsibleUserId(
+          txDb, locked.companyId, actor.userId,
+          patch.parentIssueId === undefined ? locked.parentIssueId : patch.parentIssueId,
+        );
+        if (!responsibleUserId) throw unprocessable("Routine requires a responsible user");
 
         const candidate: RoutineRow = {
           ...locked,
@@ -2533,63 +2465,65 @@ export function routineService(
     ): Promise<{ trigger: RoutineTrigger; revision: RoutineRevision } | null> => {
       const existing = await getTriggerById(id);
       if (!existing) return null;
-
-      let nextRunAt = existing.nextRunAt;
-      let cronExpression = existing.cronExpression;
-      let timezone = existing.timezone;
-
-      if (existing.kind === "schedule") {
-        const routine = await getRoutineById(existing.routineId);
-        if (!routine) throw notFound("Routine not found");
-        if (patch.cronExpression !== undefined) {
-          if (patch.cronExpression == null) throw unprocessable("Scheduled triggers require cronExpression");
-          const error = validateCron(patch.cronExpression);
-          if (error) throw unprocessable(error);
-          cronExpression = patch.cronExpression;
-        }
-        if (patch.timezone !== undefined) {
-          if (patch.timezone == null) throw unprocessable("Scheduled triggers require timezone");
-          assertTimeZone(patch.timezone);
-          timezone = patch.timezone;
-        }
-        if (cronExpression && timezone) {
-          nextRunAt = nextCronTickInTimeZone(cronExpression, timezone, new Date());
-        }
-        if ((patch.enabled ?? existing.enabled) === true) {
-          assertScheduleCompatibleVariables(routine.variables ?? []);
-        }
-      }
-
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
+        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} and ${routines.companyId} = ${existing.companyId} for update`);
+        // Routine configuration writers use Routine -> trigger order. The
+        // trigger lock also excludes cursor-only scheduler updates while PATCH
+        // merges the current cursor and fields, instead of replaying old ones.
+        const current = await txDb.select().from(routineTriggers)
+          .where(and(eq(routineTriggers.id, id), eq(routineTriggers.companyId, existing.companyId),
+            eq(routineTriggers.routineId, existing.routineId)))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!current) return null;
+        const routine = await txDb.select().from(routines)
+          .where(and(eq(routines.id, current.routineId), eq(routines.companyId, current.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!routine) throw notFound("Routine not found");
+        let nextRunAt = current.nextRunAt;
+        let cronExpression = current.cronExpression;
+        let timezone = current.timezone;
+        if (current.kind === "schedule") {
+          if (patch.cronExpression !== undefined) {
+            if (patch.cronExpression == null) throw unprocessable("Scheduled triggers require cronExpression");
+            const error = validateCron(patch.cronExpression);
+            if (error) throw unprocessable(error);
+            cronExpression = patch.cronExpression;
+          }
+          if (patch.timezone !== undefined) {
+            if (patch.timezone == null) throw unprocessable("Scheduled triggers require timezone");
+            assertTimeZone(patch.timezone);
+            timezone = patch.timezone;
+          }
+          const scheduleChanged = cronExpression !== current.cronExpression || timezone !== current.timezone;
+          const reactivated = (!current.enabled && patch.enabled === true) || (current.archived && patch.archived === false);
+          if ((scheduleChanged || reactivated) && cronExpression && timezone) {
+            nextRunAt = nextCronTickInTimeZone(cronExpression, timezone, new Date());
+          }
+          if ((patch.enabled ?? current.enabled) === true) assertScheduleCompatibleVariables(routine.variables ?? []);
+        }
         const [updated] = await txDb
           .update(routineTriggers)
           .set({
-            label: patch.label === undefined ? existing.label : patch.label,
-            enabled: patch.enabled ?? existing.enabled,
+            label: patch.label === undefined ? current.label : patch.label,
+            enabled: patch.enabled ?? current.enabled,
             ...(patch.setupPending === false ? { setupPending: false } : {}),
             ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
             cronExpression,
             timezone,
             nextRunAt,
-            signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
-            replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
+            signingMode: patch.signingMode === undefined ? current.signingMode : patch.signingMode,
+            replayWindowSec: patch.replayWindowSec === undefined ? current.replayWindowSec : patch.replayWindowSec,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),
           })
-          .where(eq(routineTriggers.id, id))
+          .where(and(eq(routineTriggers.id, id), eq(routineTriggers.companyId, current.companyId),
+            eq(routineTriggers.routineId, current.routineId)))
           .returning();
         if (!updated) return null;
-        const routine = await txDb
-          .select()
-          .from(routines)
-          .where(eq(routines.id, existing.routineId))
-          .then((rows) => rows[0] ?? null);
-        if (!routine) throw notFound("Routine not found");
         const appended = await appendRoutineRevision(txDb, routine, actor, {
-          changeSummary: `Updated ${existing.kind} trigger`,
+          changeSummary: `Updated ${current.kind} trigger`,
         });
         return { trigger: updated as RoutineTrigger, revision: appended.revision };
       });

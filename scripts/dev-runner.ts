@@ -1,4 +1,5 @@
 #!/usr/bin/env -S node --import tsx
+import { assertStartupMigrationEnvironment, closedStartupMigrationError, coreMigrationMode, requireMigrationInspectionPayload, startupMigrationChildEnvironment, StartupMigrationPolicyError } from "../packages/db/src/startup-migration-policy.ts";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -20,6 +21,7 @@ import {
 } from "../server/src/dev-server-status.ts";
 import {
   findAdoptableLocalService,
+  hasLocalServiceEvidenceReadOnly,
   removeLocalServiceRegistryRecord,
   touchLocalServiceRegistryRecord,
   writeLocalServiceRegistryRecord,
@@ -42,10 +44,15 @@ try {
   process.exit(1);
 }
 
-const worktreeEnvBootstrap = bootstrapDevRunnerWorktreeEnv(repoRoot, process.env);
+assertStartupMigrationEnvironment();
+const worktreeEnvBootstrap = coreMigrationMode === "inspect_only"
+  ? { envPath: null, missingEnv: false } : bootstrapDevRunnerWorktreeEnv(repoRoot, process.env);
+assertStartupMigrationEnvironment();
 if (worktreeEnvBootstrap.missingEnv) {
+  const missingEnvPath = worktreeEnvBootstrap.envPath
+    ? path.relative(repoRoot, worktreeEnvBootstrap.envPath) : ".paperclip/.env";
   console.error(
-    `[paperclip] linked git worktree at ${repoRoot} is missing ${path.relative(repoRoot, worktreeEnvBootstrap.envPath)}. Run \`paperclipai worktree init\` in this worktree before \`pnpm dev\`.`,
+    `[paperclip] linked git worktree at ${repoRoot} is missing ${missingEnvPath}. Run \`paperclipai worktree init\` in this worktree before \`pnpm dev\`.`,
   );
   process.exit(1);
 }
@@ -225,7 +232,16 @@ const devService = createDevServiceIdentity({
   port: serverPort,
 });
 
-const existingRunner = await findAdoptableLocalService({
+if (coreMigrationMode === "inspect_only") {
+  try {
+    if (await hasLocalServiceEvidenceReadOnly({ serviceKey: devService.serviceKey, port: serverPort })) {
+      throw new StartupMigrationPolicyError("existing_runner_unverified");
+    }
+  } catch (error) {
+    throw closedStartupMigrationError(error, "existing_runner_unverified");
+  }
+}
+const existingRunner = coreMigrationMode === "inspect_only" ? null : await findAdoptableLocalService({
   serviceKey: devService.serviceKey,
   cwd: repoRoot,
   envFingerprint: devService.envFingerprint,
@@ -265,15 +281,31 @@ function toError(error: unknown, context = "Dev runner command failed") {
   }
 }
 
+// Strict mode never publishes/touches/removes the shared registry. A stale or
+// concurrent old record must not be attributed to this runner or cleaned by it.
+async function removeDevServiceRecord() {
+  if (coreMigrationMode === "legacy") await removeLocalServiceRegistryRecord(devService.serviceKey);
+}
+
 process.on("uncaughtException", async (error) => {
-  await removeLocalServiceRegistryRecord(devService.serviceKey);
+  if (coreMigrationMode === "inspect_only") {
+    process.stderr.write(`${closedStartupMigrationError(error, "startup_configuration_unavailable").message}\n`);
+    await removeDevServiceRecord().catch(() => {});
+    process.exit(1);
+  }
+  await removeDevServiceRecord();
   const err = toError(error, "Uncaught exception in dev runner");
   process.stderr.write(`${err.stack ?? err.message}\n`);
   process.exit(1);
 });
 
 process.on("unhandledRejection", async (reason) => {
-  await removeLocalServiceRegistryRecord(devService.serviceKey);
+  if (coreMigrationMode === "inspect_only") {
+    process.stderr.write(`${closedStartupMigrationError(reason, "startup_configuration_unavailable").message}\n`);
+    await removeDevServiceRecord().catch(() => {});
+    process.exit(1);
+  }
+  await removeDevServiceRecord();
   const err = toError(reason, "Unhandled promise rejection in dev runner");
   process.stderr.write(`${err.stack ?? err.message}\n`);
   process.exit(1);
@@ -341,6 +373,7 @@ function getDevServerRestartRequest() {
 }
 
 async function updateDevServiceRecord(extra?: Record<string, unknown>) {
+  if (coreMigrationMode === "inspect_only") return;
   await writeLocalServiceRegistryRecord({
     version: 1,
     serviceKey: devService.serviceKey,
@@ -376,7 +409,7 @@ async function runPnpm(args: string[], options: {
   return await new Promise<{ code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolve, reject) => {
     const spawned = spawn(pnpmBin, args, {
       stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
-      env: options.env ?? process.env,
+      env: startupMigrationChildEnvironment(options.env ?? process.env),
       cwd: options.cwd,
       shell: process.platform === "win32",
     });
@@ -410,10 +443,25 @@ async function runPnpm(args: string[], options: {
 }
 
 async function getMigrationStatusPayload() {
-  const status = await runPnpm(
-    ["--silent", "--filter", "@paperclipai/db", "exec", "tsx", "src/migration-status.ts", "--json"],
-    { env },
-  );
+  let status: Awaited<ReturnType<typeof runPnpm>>;
+  try {
+    status = await runPnpm(
+      ["--silent", "--filter", "@paperclipai/db", "exec", "tsx", "src/migration-status.ts", "--json"],
+      { env: startupMigrationChildEnvironment(env) },
+    );
+  } catch (error) {
+    if (coreMigrationMode === "inspect_only") throw closedStartupMigrationError(error, "inspection_failed");
+    throw error;
+  }
+  if (coreMigrationMode === "inspect_only") {
+    if (status.signal || status.code !== 0 || Buffer.byteLength(status.stdout, "utf8") > 64 * 1024) {
+      throw new StartupMigrationPolicyError("inspection_failed");
+    }
+    const lines = status.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.startsWith("{"));
+    if (lines.length !== 1) throw new StartupMigrationPolicyError("inspection_payload_invalid");
+    try { return requireMigrationInspectionPayload(JSON.parse(lines[0])); }
+    catch (error) { throw closedStartupMigrationError(error, "inspection_payload_invalid"); }
+  }
   if (status.code !== 0) {
     process.stderr.write(
       status.stderr ||
@@ -456,11 +504,18 @@ async function refreshPendingMigrations() {
 }
 
 async function maybePreflightMigrations(options: { interactive?: boolean; autoApply?: boolean; exitOnDecline?: boolean } = {}) {
+  assertStartupMigrationEnvironment(env);
   const interactive = options.interactive ?? mode === "watch";
   const autoApply = options.autoApply ?? env.PAPERCLIP_MIGRATION_AUTO_APPLY === "true";
   const exitOnDecline = options.exitOnDecline ?? mode === "watch";
 
   const payload = await refreshPendingMigrations();
+  if (coreMigrationMode === "inspect_only") {
+    if (requireMigrationInspectionPayload(payload).status !== "upToDate") {
+      throw new StartupMigrationPolicyError("migrations_pending");
+    }
+    return;
+  }
   if (payload.status !== "needsMigrations" || pendingMigrations.length === 0) {
     return;
   }
@@ -680,7 +735,7 @@ async function getDevHealthPayload() {
   if (!response.ok) {
     throw new Error(`Health request failed (${response.status})`);
   }
-  return await parseJsonResponseWithLimit(response);
+  return await parseJsonResponseWithLimit<{ devServer?: { enabled?: boolean; autoRestartEnabled?: boolean; activeRunCount?: number } }>(response);
 }
 
 async function waitForChildExit() {
@@ -714,7 +769,7 @@ async function startServerChild() {
   child = spawn(
     pnpmBin,
     ["--filter", "@paperclipai/server", serverScript, ...forwardedArgs],
-    { stdio: "inherit", env, shell: process.platform === "win32" },
+    { stdio: "inherit", env: startupMigrationChildEnvironment(env), shell: process.platform === "win32" },
   );
 
   childExitPromise = new Promise((resolve, reject) => {
@@ -724,7 +779,7 @@ async function startServerChild() {
       childExitWasExpected = false;
       child = null;
       childExitPromise = null;
-      void touchLocalServiceRegistryRecord(devService.serviceKey, {
+      if (coreMigrationMode === "legacy") void touchLocalServiceRegistryRecord(devService.serviceKey, {
         metadata: {
           repoRoot,
           mode,
@@ -824,7 +879,9 @@ async function maybeAutoRestartChild() {
     }
   } catch (error) {
     const err = toError(error, "Auto-restart failed");
-    process.stderr.write(`${err.stack ?? err.message}\n`);
+    process.stderr.write(coreMigrationMode === "inspect_only"
+      ? `${closedStartupMigrationError(error, "inspection_failed").message}\n`
+      : `${err.stack ?? err.message}\n`);
     process.exit(1);
   } finally {
     restartInFlight = false;
@@ -835,10 +892,22 @@ function installDevIntervals() {
   if (mode !== "dev") return;
 
   scanTimer = setInterval(() => {
-    void scanForBackendChanges();
+    if (coreMigrationMode === "inspect_only") {
+      void scanForBackendChanges().catch((error) => {
+        process.stderr.write(`${closedStartupMigrationError(error, "inspection_failed").message}\n`);
+        clearDevIntervals();
+        process.exit(1);
+      });
+    } else void scanForBackendChanges();
   }, scanIntervalMs);
   autoRestartTimer = setInterval(() => {
-    void maybeAutoRestartChild();
+    if (coreMigrationMode === "inspect_only") {
+      void maybeAutoRestartChild().catch((error) => {
+        process.stderr.write(`${closedStartupMigrationError(error, "inspection_failed").message}\n`);
+        clearDevIntervals();
+        process.exit(1);
+      });
+    } else void maybeAutoRestartChild();
   }, autoRestartPollIntervalMs);
 }
 
@@ -858,7 +927,7 @@ async function shutdown(signal: NodeJS.Signals) {
   shuttingDown = true;
   clearDevIntervals();
   clearDevServerStatus();
-  await removeLocalServiceRegistryRecord(devService.serviceKey);
+  await removeDevServiceRecord();
 
   if (!child) {
     exitForSignal(signal);
@@ -901,7 +970,7 @@ installDevIntervals();
 
 if (mode === "watch") {
   const exit = await waitForChildExit();
-  await removeLocalServiceRegistryRecord(devService.serviceKey);
+  await removeDevServiceRecord();
   if (exit.signal) {
     exitForSignal(exit.signal);
   }

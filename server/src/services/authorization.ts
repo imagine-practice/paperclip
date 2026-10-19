@@ -4,6 +4,7 @@ import { withHumanDirectedWork } from "./human-directed-work.js";
 import { hasOwnerChatInstructionAuthority } from "./owner-chat-instruction-authority.js";
 import {
   agents,
+  companies,
   approvals,
   issueApprovals,
   authUsers,
@@ -44,6 +45,9 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
+import { assertPipelineBudgetHealthy, assertPipelineBudgetTransaction, assertPipelineBudgetDepth,
+  enterPipelineBudgetFrame, leavePipelineBudgetFrame, failPipelineRootBudget, registerPipelineBudgetReference,
+  runPipelineBudgetSelect, type PipelineBudgetSqlLimits, type PipelineBudgetReference, type PipelineRootBudgetContext } from "./pipeline-root-budget.js";
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
@@ -569,16 +573,29 @@ export async function canActorReadProjectPrivacy(db: Db | DbTransaction, actor: 
     .limit(1).then(rows => rows.length > 0);
 }
 
+function activeMembershipCondition(companyId: string, principalType: PrincipalType, principalId: string) {
+  return and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalType, principalType),
+    eq(companyMemberships.principalId, principalId), eq(companyMemberships.status, "active"));
+}
+function issuePrivacyImplicitCondition(principal: ReturnType<typeof issuePrivacyPrincipal>): SQL<boolean> {
+  return principal?.type === "agent" ? sql<boolean>`n.assignee_agent_id = ${principal.id}`
+    : principal?.type === "user"
+      ? sql<boolean>`(n.responsible_user_id = ${principal.id} or n.created_by_user_id = ${principal.id} or n.assignee_user_id = ${principal.id})`
+      : sql<boolean>`false`;
+}
+function issuePrivacyNodeAccess(implicit: SQL, grant: SQL, projectMember: SQL): SQL<boolean> {
+  return sql<boolean>`(${implicit} or ${grant} or ${projectMember})`;
+}
+function issuePrivacyRestricted(visibility: SQL, privateProject: SQL): SQL<boolean> {
+  return sql<boolean>`(${visibility} = 'private' or ${privateProject})`;
+}
+
 /** One predicate for direct reads and SQL pushdown. Grants flow only from a task
  * to its privacy descendants, never from a child to its ancestors or siblings.
  * UNION bounds traversal even if historical data contains a cycle. */
 function issuePrivacyPrincipalCondition(actor: AuthorizationActor): SQL<boolean> {
   const principal = issuePrivacyPrincipal(actor);
-  const implicit = principal?.type === "agent"
-    ? sql`n.assignee_agent_id = ${principal.id}`
-    : principal?.type === "user"
-      ? sql`(n.responsible_user_id = ${principal.id} or n.created_by_user_id = ${principal.id} or n.assignee_user_id = ${principal.id})`
-      : sql`false`;
+  const implicit = issuePrivacyImplicitCondition(principal);
   const grant = principal ? sql`exists (
     select 1 from ${issueAccessGrants} g where g.issue_id = n.id
       and g.subject_type = ${principal.type} and g.subject_id = ${principal.id}
@@ -599,15 +616,15 @@ function issuePrivacyPrincipalCondition(actor: AuthorizationActor): SQL<boolean>
       select p.id, p.company_id, p.privacy_parent_issue_id, p.visibility, p.project_id,
         p.responsible_user_id, p.created_by_user_id, p.assignee_user_id, p.assignee_agent_id
       from issues p join privacy_ancestors c on p.id = c.privacy_parent_issue_id and p.company_id = c.company_id
-      where p.visibility = 'private' or exists (select 1 from projects pp where pp.id = p.project_id and pp.company_id = p.company_id and pp.visibility = 'private')
+      where ${issuePrivacyRestricted(sql`p.visibility`, sql`exists (select 1 from projects pp where pp.id = p.project_id and pp.company_id = p.company_id and pp.visibility = 'private')`)}
     )
     select 1 from privacy_ancestors n
-    where ${implicit} or ${grant} or ${projectMember}
+    where ${issuePrivacyNodeAccess(implicit, grant, projectMember)}
       or not exists (
         select 1 from privacy_ancestors restricted
         left join projects private_project on private_project.id = restricted.project_id
           and private_project.company_id = restricted.company_id
-        where restricted.visibility = 'private' or private_project.visibility = 'private'
+        where ${issuePrivacyRestricted(sql`restricted.visibility`, sql`private_project.visibility = 'private'`)}
       )
   )`;
 }
@@ -620,6 +637,193 @@ function issuePrivacyCondition(actor: AuthorizationActor): SQL<boolean> {
   return sql<boolean>`(${principalCondition} and ${issuePrivacyPrincipalCondition({ type: "board", userId })}
     and exists (select 1 from ${companyMemberships} m where m.company_id = ${issues.companyId}
       and m.principal_type = 'user' and m.principal_id = ${userId} and m.status = 'active'))`;
+}
+
+type BoundedReadFact = { kind: string; id: string; data: Record<string, unknown> };
+export type BoundedBoardIssueReadCapability =
+  | Readonly<{ status: "unsupported" }>
+  | Readonly<{ status: "supported"; readIssue: (issueId: string) => Promise<Readonly<{ allowed: boolean }>> }>;
+
+/** Internal, unconnected reader. Authentication/consent is supplied only by a trusted owner.
+ * Every read revalidates current facts in one SQL snapshot; no previous allow is retained.
+ * This is not a final multi-reference projection, a write authorization, or a plugin sandbox. */
+export function createBoundedBoardIssueReadCapability(
+  tx: DbTransaction, context: PipelineRootBudgetContext, actor: AuthorizationActor,
+): BoundedBoardIssueReadCapability {
+  assertPipelineBudgetTransaction(context, tx);
+  if (!actor || actor.type !== "board" || (actor.source !== "session" && actor.source !== "board_key")
+    || typeof actor.userId !== "string" || !actor.userId || actor.userId === "board" || actor.userId === "local-board"
+    || actor.userId.includes("\0") || Buffer.byteLength(actor.userId, "utf8") > 256
+    || actor.agentId || actor.onBehalfOfUserId || actor.keyScope || !Array.isArray(actor.companyIds)) {
+    return Object.freeze({ status: "unsupported" });
+  }
+  // Copy the attested request consent; mutable actor memberships/admin flags are never permission facts.
+  const companyId = context.companyId, userId = actor.userId;
+  const consent = Object.freeze([...actor.companyIds]);
+  if (!consent.includes(companyId)) return Object.freeze({ status: "unsupported" });
+  const principal = issuePrivacyPrincipal({ type: "board", userId });
+  return Object.freeze({ status: "supported", readIssue: async (requestedIssueId: string) => {
+    assertPipelineBudgetTransaction(context, tx);
+    const frame = enterPipelineBudgetFrame(context);
+    try {
+      // Validate before SQL; this also registers the actual target in the shared reference budget.
+      registerPipelineBudgetReference(context, { companyId, kind: "issue", id: requestedIssueId });
+      const issueId = requestedIssueId.toLowerCase();
+      let configuredLimits: PipelineBudgetSqlLimits | null = null;
+      await runPipelineBudgetSelect(context, 1, async limits => {
+        assertPipelineBudgetTransaction(context, tx);
+        // This first configuration query still relies on the trusted owner's initial root timeout.
+        const rows = await tx.execute(sql`select set_config('statement_timeout', ${String(limits.statementMs)}, true),
+          set_config('lock_timeout', ${String(limits.lockMs)}, true),
+          set_config('idle_in_transaction_session_timeout', ${String(limits.idleMs)}, true)`);
+        configuredLimits = limits;
+        return rows;
+      });
+      const inherit = issuePrivacyRestricted(sql`p.visibility`, sql`exists (
+        select 1 from projects pp where pp.id = p.project_id and pp.company_id = p.company_id and pp.visibility = 'private')`);
+      const implicit = issuePrivacyImplicitCondition(principal);
+      const access = issuePrivacyNodeAccess(implicit, sql`exists (select 1 from bounded_grants g where g.issue_id = n.id)`,
+        sql`exists (select 1 from bounded_project_members m join bounded_projects p on p.id = m.project_id
+          and p.company_id = m.company_id where p.id = n.project_id and p.company_id = n.company_id and p.visibility = 'private')`);
+      const restriction = issuePrivacyRestricted(sql`n.visibility`, sql`p.visibility = 'private'`);
+      const query = sql`
+        with recursive bounded_nodes as (
+          select p.id, p.company_id, p.privacy_parent_issue_id, p.visibility, p.project_id,
+            p.responsible_user_id, p.created_by_user_id, p.assignee_user_id, p.assignee_agent_id,
+            1 as depth, array[p.id] as path, false as cycle, true as included
+          from issues p where p.id = ${issueId}::uuid
+          union all
+          select p.id, p.company_id, p.privacy_parent_issue_id, p.visibility, p.project_id,
+            p.responsible_user_id, p.created_by_user_id, p.assignee_user_id, p.assignee_agent_id,
+            c.depth + 1, c.path || p.id, p.id = any(c.path), ${inherit}
+          from issues p join bounded_nodes c on p.id = c.privacy_parent_issue_id
+          where c.included and not c.cycle and c.depth <= 32
+        ), bounded_projects as materialized (
+          select p.id, p.company_id, p.visibility from projects p
+          where p.id in (select n.project_id from bounded_nodes n) order by p.id limit 129
+        ), bounded_grants as materialized (
+          select g.id, g.issue_id, g.subject_type, g.subject_id, g.revoked_at from issue_access_grants g
+          where g.issue_id in (select n.id from bounded_nodes n where n.included)
+            and g.subject_type = 'user' and g.subject_id = ${userId} and g.revoked_at is null
+          order by g.id limit 129
+        ), bounded_project_members as materialized (
+          select m.id, m.company_id, m.project_id, m.subject_type, m.subject_id from project_access_members m
+          where m.project_id in (select p.id from bounded_projects p where p.visibility = 'private')
+            and m.subject_type = 'user' and m.subject_id = ${userId} order by m.id limit 129
+        ), bounded_company as materialized (
+          select id from ${companies} where id = ${companyId}::uuid
+        ), bounded_user as materialized (
+          select id from ${authUsers} where id = ${userId}
+        ), bounded_membership as materialized (
+          select id, company_id, principal_type, principal_id, status from ${companyMemberships}
+          where ${activeMembershipCondition(companyId, "user", userId)} order by id limit 2
+        ), facts as (
+          select '00_control'::text as kind, ${issueId}::text as id, jsonb_build_object(
+            'nativeAllowed', exists(select 1 from bounded_company) and exists(select 1 from bounded_user)
+              and exists(select 1 from bounded_membership),
+            'privacyAllowed', exists(select 1 from bounded_nodes n where n.included and (
+              ${access} or not exists(select 1 from bounded_nodes n left join bounded_projects p
+                on p.id = n.project_id and p.company_id = n.company_id where n.included and ${restriction})
+            ))) as data
+          union all select '10_company', id::text, jsonb_build_object('companyId', id) from bounded_company
+          union all select '20_user', id, jsonb_build_object() from bounded_user
+          union all select '30_membership', id::text, jsonb_build_object('companyId', company_id,
+            'subjectType', principal_type, 'subjectId', principal_id, 'status', status) from bounded_membership
+          union all select '40_issue', id::text, jsonb_build_object('companyId', company_id,
+            'parentId', privacy_parent_issue_id, 'projectId', project_id, 'visibility', visibility,
+            'depth', depth, 'included', included, 'cycle', cycle) from bounded_nodes
+          union all select '50_project', id::text, jsonb_build_object('companyId', company_id, 'visibility', visibility) from bounded_projects
+          union all select '60_grant', id::text, jsonb_build_object('issueId', issue_id,
+            'subjectType', subject_type, 'subjectId', subject_id, 'revokedAt', revoked_at) from bounded_grants
+          union all select '70_project_member', id::text, jsonb_build_object('companyId', company_id,
+            'projectId', project_id, 'subjectType', subject_type, 'subjectId', subject_id) from bounded_project_members
+        ) select kind, id, data from facts order by kind, id limit 129`;
+      const facts = await runPipelineBudgetSelect(context, 129, async limits => {
+        // Reject before the real read if elapsed configuration work made any setting too loose.
+        if (!configuredLimits || configuredLimits.statementMs > limits.statementMs
+          || configuredLimits.lockMs > limits.lockMs || configuredLimits.idleMs > limits.idleMs) {
+          failPipelineRootBudget(context, "deadline");
+        }
+        assertPipelineBudgetTransaction(context, tx);
+        return tx.execute<BoundedReadFact>(query);
+      });
+      // The actual 129th row is an overflow sentinel; no summary is expanded into invented rows.
+      const overflow = facts.length >= 129;
+      // Core proof rows precede wide ACLs: at most 1+1+1+2+33+33 = 71 rows.
+      // The membership sentinel detects a missing uniqueness invariant without hiding nodes/projects.
+      const nodes = facts.filter(row => row.kind === "40_issue"), projectsFound = facts.filter(row => row.kind === "50_project");
+      const control = facts.filter(row => row.kind === "00_control");
+      if (control.length !== 1 || control[0].id !== issueId
+        || typeof control[0].data?.nativeAllowed !== "boolean" || typeof control[0].data?.privacyAllowed !== "boolean") {
+        failPipelineRootBudget(context, "coverage");
+      }
+      if (!facts.some(row => row.kind === "10_company" && row.id === companyId)
+        || !nodes.some(row => row.id === issueId && row.data.depth === 1 && row.data.included === true)) {
+        failPipelineRootBudget(context, "scope");
+      }
+      const seen = new Set<string>();
+      let maxDepth = 0;
+      const pendingReferences: PipelineBudgetReference[] = [];
+      const referenceUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      for (const row of facts) {
+        assertPipelineBudgetHealthy(context);
+        if (!row || typeof row.id !== "string" || !row.data || typeof row.data !== "object" || Array.isArray(row.data)) {
+          failPipelineRootBudget(context, "coverage");
+        }
+        const key = `${row.kind}|${row.id}`;
+        if (seen.has(key)) failPipelineRootBudget(context, "coverage");
+        seen.add(key);
+        if (row.kind === "00_control") continue;
+        if (row.kind === "20_user") {
+          if (row.id !== userId) failPipelineRootBudget(context, "scope");
+          pendingReferences.push({ companyId, kind: "auth_user", id: row.id });
+          continue;
+        }
+        if (!referenceUuid.test(row.id)) failPipelineRootBudget(context, "scope");
+        if (row.kind !== "60_grant" && row.data.companyId !== companyId) failPipelineRootBudget(context, "scope");
+        if (row.kind === "40_issue") {
+          if (typeof row.data.depth !== "number" || !Number.isSafeInteger(row.data.depth) || row.data.depth < 1
+            || typeof row.data.included !== "boolean" || typeof row.data.cycle !== "boolean") failPipelineRootBudget(context, "coverage");
+          maxDepth = Math.max(maxDepth, row.data.depth as number);
+          if (row.data.cycle) failPipelineRootBudget(context, "coverage");
+          if (row.data.visibility !== "open" && row.data.visibility !== "private") failPipelineRootBudget(context, "coverage");
+          if (row.data.projectId !== null && !projectsFound.some(p => p.id === row.data.projectId)) failPipelineRootBudget(context, "scope");
+          if (row.data.included && (row.data.depth as number) <= 32 && row.data.parentId !== null && !nodes.some(n => n.id === row.data.parentId)) failPipelineRootBudget(context, "scope");
+        } else if (row.kind === "50_project") {
+          if (row.data.visibility !== "open" && row.data.visibility !== "private") failPipelineRootBudget(context, "coverage");
+        } else if (row.kind === "30_membership") {
+          if (row.data.subjectType !== "user" || row.data.subjectId !== userId || row.data.status !== "active") failPipelineRootBudget(context, "scope");
+        } else if (row.kind === "60_grant") {
+          if (row.data.subjectType !== "user" || row.data.subjectId !== userId || row.data.revokedAt !== null
+            || !nodes.some(n => n.id === row.data.issueId && n.data.included)) failPipelineRootBudget(context, "scope");
+        } else if (row.kind === "70_project_member") {
+          if (row.data.subjectType !== "user" || row.data.subjectId !== userId
+            || !projectsFound.some(p => p.id === row.data.projectId && p.data.visibility === "private")) failPipelineRootBudget(context, "scope");
+        }
+        const kind = row.kind === "10_company" ? "company" : row.kind === "30_membership" ? "company_membership"
+          : row.kind === "40_issue" ? "issue" : row.kind === "50_project" ? "project"
+          : row.kind === "60_grant" ? "issue_access_grant" : row.kind === "70_project_member" ? "project_access_member" : null;
+        if (!kind) failPipelineRootBudget(context, "coverage");
+        pendingReferences.push({ companyId, kind, id: row.id });
+      }
+      if (facts.filter(row => row.kind === "30_membership").length > 1) failPipelineRootBudget(context, "coverage");
+      // Only classify resource overflow after all returned candidates, including the sentinel,
+      // have their raw scope/relationships and the same-snapshot necessary read checked.
+      if (overflow && (control[0].data.nativeAllowed !== true || control[0].data.privacyAllowed !== true)) {
+        failPipelineRootBudget(context, "scope");
+      }
+      // Resource registration is separate: no ref cap can preempt a later returned scope check.
+      for (const ref of pendingReferences) registerPipelineBudgetReference(context, ref);
+      assertPipelineBudgetDepth(context, maxDepth);
+      if (overflow) failPipelineRootBudget(context, "budget");
+      assertPipelineBudgetHealthy(context);
+      return Object.freeze({ allowed: control[0].data.nativeAllowed === true && control[0].data.privacyAllowed === true });
+    } catch {
+      failPipelineRootBudget(context, "coverage");
+    } finally {
+      leavePipelineBudgetFrame(context, frame);
+    }
+  } });
 }
 
 export async function canActorReadIssuePrivacy(db: Db | DbTransaction, actor: AuthorizationActor, issue: IssuePrivacyRow) {
@@ -748,12 +952,7 @@ export function authorizationService(db: Db | DbTransaction) {
       .select()
       .from(companyMemberships)
       .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, principalType),
-          eq(companyMemberships.principalId, principalId),
-          eq(companyMemberships.status, "active"),
-        ),
+        activeMembershipCondition(companyId, principalType, principalId),
       )
       .then((rows) => rows[0] ?? null);
   }

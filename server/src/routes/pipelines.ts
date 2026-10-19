@@ -85,7 +85,10 @@ import {
 import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
-import { assertCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess } from "./authz.js";
+import { readPipelineAutomationReconciliation } from "../services/pipeline-automation-reconciliation.js";
+import { readPipelineOperationReceipt } from "../services/pipeline-operation-receipts.js";
+import { pipelineOperationTransitionRequestSchema } from "@paperclipai/shared";
 import {
   computePipelineHealth,
   deriveCaseType,
@@ -596,11 +599,6 @@ async function assertCaseAccess(db: Db, req: Request, caseId: string) {
   return companyId;
 }
 
-async function getStagesByKey(db: Db, pipelineId: string) {
-  const rows = await db.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, pipelineId));
-  return new Map(rows.map((stage) => [stage.key, stage]));
-}
-
 async function writeRouteEvent(
   db: Pick<Db, "insert">,
   input: {
@@ -1057,18 +1055,8 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const pipelineId = req.params.pipelineId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
-    actorForMutation(req);
-    const patch: Partial<typeof pipelines.$inferInsert> = { updatedAt: new Date() };
-    if (req.body.name !== undefined) patch.name = req.body.name;
-    if (req.body.description !== undefined) patch.description = req.body.description;
-    if (req.body.enforceTransitions !== undefined) patch.enforceTransitions = req.body.enforceTransitions;
-    if (req.body.archived !== undefined) patch.archivedAt = req.body.archived ? new Date() : null;
-    const [updated] = await db
-      .update(pipelines)
-      .set(patch)
-      .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
-      .returning();
-    res.json(updated);
+    const actor = actorForMutation(req);
+    res.json(await svc.updatePipeline({ companyId, pipelineId, patch: req.body, actor }));
   });
 
   router.post("/pipelines/:pipelineId/stages", validate(createStageSchema), async (req, res) => {
@@ -1142,22 +1130,9 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const pipelineId = req.params.pipelineId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
-    actorForMutation(req);
-    const byKey = await getStagesByKey(db, pipelineId);
-    const transitions = req.body.transitions.map((edge: z.infer<typeof replaceTransitionsSchema>["transitions"][number]) => {
-      const from = byKey.get(edge.fromStageKey);
-      const to = byKey.get(edge.toStageKey);
-      if (!from || !to) throw unprocessable("Transition references unknown stage", { code: "validation" });
-      return { pipelineId, fromStageId: from.id, toStageId: to.id, label: edge.label ?? null };
-    });
-    const result = await db.transaction(async (tx) => {
-      await tx.delete(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, pipelineId));
-      if (req.body.enforceTransitions !== undefined) {
-        await tx.update(pipelines).set({ enforceTransitions: req.body.enforceTransitions, updatedAt: new Date() })
-          .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)));
-      }
-      return transitions.length ? tx.insert(pipelineTransitions).values(transitions).returning() : [];
-    });
+    const actor = actorForMutation(req);
+    const result = await svc.replaceTransitions({ companyId, pipelineId, transitions: req.body.transitions,
+      enforceTransitions: req.body.enforceTransitions, actor });
     res.json({ transitions: result });
   });
 
@@ -1826,9 +1801,29 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     res.json(await svc.releaseCase({ companyId, caseId, actor, leaseToken: req.body.leaseToken, force: req.body.force }));
   });
 
-  router.post("/cases/:caseId/transition", validate(transitionCaseSchema), async (req, res) => {
+  router.get("/companies/:companyId/pipeline-operations/:operationId", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    assertBoard(req);
+    const companyId = z.string().guid().parse(req.params.companyId).toLowerCase();
+    const operationId = z.string().guid().parse(req.params.operationId).toLowerCase();
+    // Read authorization and all saved references are checked inside one read-only snapshot.
+    res.json(await readPipelineOperationReceipt(db, { companyId, operationId, actor: req.actor }));
+  });
+
+  router.post("/cases/:caseId/transition", (req, res, next) => {
+    // Choose before parsing: the legacy schema must not strip operationId or
+    // unknown fields and silently downgrade an intended new protocol request.
+    const operationRequested = req.body && typeof req.body === "object" && Object.hasOwn(req.body, "operationId");
+    return validate(operationRequested ? pipelineOperationTransitionRequestSchema : transitionCaseSchema)(req, res, next);
+  }, async (req, res) => {
     const caseId = req.params.caseId as string;
     const companyId = await assertCaseAccess(db, req, caseId);
+    if (Object.hasOwn(req.body, "operationId")) {
+      res.setHeader("Cache-Control", "no-store");
+      assertBoard(req);
+      res.json(await svc.transitionCaseWithReceipt({ companyId, caseId, actor: req.actor, request: req.body }));
+      return;
+    }
     const actor = actorForMutation(req);
     res.json(await svc.transitionCase({
       companyId,
@@ -2097,6 +2092,14 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       outputSummaries,
       events: [...events.items].reverse(),
     });
+  });
+
+  router.get("/cases/:caseId/automation/executions/:executionId/reconciliation", async (req, res) => {
+    assertBoard(req);
+    const caseId = z.string().uuid().parse(req.params.caseId);
+    const executionId = z.string().uuid().parse(req.params.executionId);
+    const companyId = await assertCaseAccess(db, req, caseId);
+    res.json(await readPipelineAutomationReconciliation(db, { companyId, caseId, executionId, actor: req.actor }));
   });
 
   router.get("/cases/:caseId/automation/retry-plan", async (req, res) => {

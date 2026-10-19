@@ -1,5 +1,8 @@
 import type {
   Issue,
+  PipelineAutomationReconciliation,
+  PipelineOperationReceipt,
+  PipelineOperationTransitionRequest,
   PipelineAutomationRetryCleanupOptions,
   PipelineAutomationRetryPlan,
   PipelineAutomationRetryScope,
@@ -11,7 +14,7 @@ import type {
   PipelineHealthReport,
   RoutineEnvConfig,
 } from "@paperclipai/shared";
-import { api } from "./client";
+import { api, detachInflightGet } from "./client";
 
 export type { PipelineHealthReport, PipelineHealthWarning } from "@paperclipai/shared";
 
@@ -612,6 +615,18 @@ export const pipelinesApi = {
   ) => api.post<unknown>(`/cases/${caseId}/transition`, data),
   rerunCurrentStageAutomation: (caseId: string) =>
     api.post<unknown>(`/cases/${caseId}/automation/current-stage/rerun`, {}),
+  getAutomationReconciliation: (caseId: string, executionId: string) =>
+    api.get<PipelineAutomationReconciliation>(`/cases/${encodeURIComponent(caseId)}/automation/executions/${encodeURIComponent(executionId)}/reconciliation`),
+  // Caller must persist operationId before the first HTTP attempt and retain it
+  // on an unknown outcome. No new ID generation, automatic retry or legacy fallback.
+  transitionCaseWithReceipt: (caseId: string, request: PipelineOperationTransitionRequest) =>
+    api.post<PipelineOperationReceipt>(`/cases/${encodeURIComponent(caseId)}/transition`, request),
+  // Identity lifecycle owners must abort/discard older responses on account change.
+  getOperationReceipt: (companyId: string, operationId: string, signal?: AbortSignal) => {
+    const path = `/companies/${encodeURIComponent(companyId)}/pipeline-operations/${encodeURIComponent(operationId)}`;
+    detachInflightGet(path); // Each observer must make a freshly authorized request.
+    return api.get<PipelineOperationReceipt>(path, { cache: "no-store", signal });
+  },
   getAutomationRetryPlan: (caseId: string, scope: PipelineAutomationRetryScope, targetStageId?: string | null) => {
     const params = new URLSearchParams({ scope });
     if (targetStageId) params.set("targetStageId", targetStageId);

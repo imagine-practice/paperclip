@@ -1,7 +1,9 @@
+import { assertMigrationWriteAllowed } from "./startup-migration-policy.js";
 import { applyPendingMigrations, inspectMigrations } from "./client.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
 
 async function main(): Promise<void> {
+  assertMigrationWriteAllowed();
   const resolved = await resolveMigrationConnection();
 
   console.log(`Migrating database via ${resolved.source}`);
