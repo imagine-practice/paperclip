@@ -13,9 +13,11 @@ const HISTORY_ERROR = "Renamed fork migration history is ambiguous or incompatib
 const FALLBACK_ERROR = "Migration history fallback cannot identify the merged fork branch.";
 
 describe("normalizeRenamedMigrationHistory", () => {
-  it("recognizes all four exact old names against their published hashes", () => {
+  it("recognizes every exact published old name against its published hash", () => {
     expect(normalizeRenamedMigrationHistory(
-      RENAMED_FORK_MIGRATIONS.map((entry) => ({ name: entry.previousName, hash: entry.sha256 })),
+      RENAMED_FORK_MIGRATIONS.flatMap((entry) =>
+        entry.previousNames.map((name) => ({ name, hash: entry.sha256 })),
+      ),
       options,
     )).toEqual(availableMigrations);
   });
@@ -24,22 +26,22 @@ describe("normalizeRenamedMigrationHistory", () => {
     const [first, second] = RENAMED_FORK_MIGRATIONS;
     expect(normalizeRenamedMigrationHistory([
       { name: second.newName, hash: second.sha256 },
-      { name: first.previousName, hash: first.sha256 },
-      { name: second.previousName, hash: second.sha256 },
+      { name: first.previousNames[0], hash: first.sha256 },
+      { name: second.previousNames[1], hash: second.sha256 },
       { name: first.newName, hash: first.sha256 },
     ], options)).toEqual([second.newName, first.newName]);
   });
 
   it("supports exact legacy names without a hash column but still validates source", () => {
     expect(normalizeRenamedMigrationHistory(
-      RENAMED_FORK_MIGRATIONS.map((entry) => ({ name: entry.previousName })),
+      RENAMED_FORK_MIGRATIONS.flatMap((entry) => entry.previousNames.map((name) => ({ name }))),
       { ...options, hasHashColumn: false },
     )).toEqual(availableMigrations);
   });
 
   it.each([undefined, null, "", "wrong-persisted-hash"])("rejects absent or contradictory hash evidence: %s", (hash) => {
     for (const entry of RENAMED_FORK_MIGRATIONS) {
-      for (const name of [entry.previousName, entry.newName]) {
+      for (const name of [...entry.previousNames, entry.newName]) {
         expect(() => normalizeRenamedMigrationHistory([{ name, hash }], options)).toThrow(HISTORY_ERROR);
       }
     }
@@ -49,7 +51,7 @@ describe("normalizeRenamedMigrationHistory", () => {
     const first = RENAMED_FORK_MIGRATIONS[0];
     expect(() => normalizeRenamedMigrationHistory([
       { name: first.newName, hash: first.sha256 },
-      { name: first.previousName, hash: RENAMED_FORK_MIGRATIONS[1].sha256 },
+      { name: first.previousNames[0], hash: RENAMED_FORK_MIGRATIONS[1].sha256 },
     ], options)).toThrow(HISTORY_ERROR);
   });
 
@@ -58,10 +60,10 @@ describe("normalizeRenamedMigrationHistory", () => {
     for (const destinations of [
       availableMigrations.slice(1),
       [...availableMigrations, first.newName],
-      [...availableMigrations, first.previousName],
+      [...availableMigrations, first.previousNames[0]],
     ]) {
       expect(() => normalizeRenamedMigrationHistory(
-        [{ name: first.previousName, hash: first.sha256 }],
+        [{ name: first.previousNames[0], hash: first.sha256 }],
         { ...options, availableMigrations: destinations },
       )).toThrow(HISTORY_ERROR);
     }
@@ -71,7 +73,7 @@ describe("normalizeRenamedMigrationHistory", () => {
     const first = RENAMED_FORK_MIGRATIONS[0];
     for (const hashes of [new Map<string, string>(), new Map([[first.newName, "altered-source"]])]) {
       expect(() => normalizeRenamedMigrationHistory(
-        [{ name: first.previousName }],
+        [{ name: first.previousNames[0] }],
         { ...options, hasHashColumn: false, fileHashes: hashes },
       )).toThrow(HISTORY_ERROR);
     }
@@ -93,7 +95,7 @@ describe("normalizeRenamedMigrationHistory", () => {
   it("never includes untrusted database values in its error", () => {
     const first = RENAMED_FORK_MIGRATIONS[0];
     expect(() => normalizeRenamedMigrationHistory([
-      { name: first.previousName, hash: "private-database-value" },
+      { name: first.previousNames[0], hash: "private-database-value" },
     ], options)).toThrow(new Error(HISTORY_ERROR));
   });
 });
@@ -135,7 +137,7 @@ describe("assertForkMigrationFallbackSafe", () => {
     expect(() => assertForkMigrationFallbackSafe(availableMigrations, [], history)).toThrow(FALLBACK_ERROR);
   });
 
-  it.each(["0320_daily_onslaught.sql", "0320_onisall_intake_drafts.sql", "0347_onisall_intake_drafts.sql", "0350_onisall_schema_sets.sql"])(
+  it.each(["0320_daily_onslaught.sql", "0320_onisall_intake_drafts.sql", "0347_onisall_intake_drafts.sql", "0350_onisall_schema_sets.sql", "0355_onisall_intake_drafts.sql"])(
     "rejects a divergent candidate even with a short history: %s", (name) => {
       expect(() => assertForkMigrationFallbackSafe(availableMigrations, [name], { rowCount: 1 })).toThrow(FALLBACK_ERROR);
     },

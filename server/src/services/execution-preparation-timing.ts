@@ -43,6 +43,7 @@ export type ExecutionPhase =
   | "workspace.materialize.directories" | "workspace.materialize.source_identity"
   | "workspace.checkout.lookup" | "workspace.checkout.git_auth" | "workspace.checkout.git_clone"
   | "workspace.checkout.git_ref" | "workspace.checkout.publish"
+  | "workspace.checkout.cache_lookup" | "workspace.checkout.cache_publish"
   | "runtime_selection.review" | "runtime_selection.contract_read" | "runtime_selection.contract_ensure"
   | "runtime_selection.resume" | "runtime_selection.recovery_profile" | "runtime_selection.profile" | "runtime_selection.interactions"
   | "runtime_selection.provider_discovery" | "runtime_selection.bootstrap" | "runtime_selection.run_write" | "runtime_selection.finalization_write"
@@ -82,6 +83,26 @@ export type ExecutionPhase =
 type RunScope = { runId: string; parent?: Context; ended: boolean; details: Map<string, number> };
 const ownership = new AsyncLocalStorage<RunScope>();
 const endpointEnabled = () => Boolean(process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim());
+
+const repositoryCacheOutcomes = ["disabled", "hit", "miss", "published", "already_present", "contended", "capacity", "budget", "invalid", "error"] as const;
+export type RepositoryObjectCacheOutcome = typeof repositoryCacheOutcomes[number];
+
+export function recordRepositoryObjectCacheDetail(detail: {
+  outcome?: RepositoryObjectCacheOutcome;
+  referenceSupplied?: boolean;
+}): void {
+  const owned = ownership.getStore();
+  if (!endpointEnabled() || !owned?.parent || owned.ended) return;
+  try {
+    const span = trace.getSpan(owned.parent);
+    if (detail.outcome && repositoryCacheOutcomes.includes(detail.outcome)) {
+      span?.setAttribute(EXECUTION_PREPARATION_SPAN_ATTRS.repositoryCacheOutcome, detail.outcome);
+    }
+    if (typeof detail.referenceSupplied === "boolean") {
+      span?.setAttribute(EXECUTION_PREPARATION_SPAN_ATTRS.repositoryCacheReferenceSupplied, detail.referenceSupplied);
+    }
+  } catch {}
+}
 
 export function getRunExecutionTraceContext(runId: string): Context | undefined {
   const owned = ownership.getStore();

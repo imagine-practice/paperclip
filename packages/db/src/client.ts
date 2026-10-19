@@ -874,7 +874,7 @@ async function loadAppliedMigrations(
     );
     const fileHashes = new Map<string, string>();
     for (const migration of RENAMED_FORK_MIGRATIONS) {
-      if (!rows.some((row) => row.name === migration.previousName || row.name === migration.newName)) continue;
+      if (!rows.some((row) => migration.previousNames.some((name) => name === row.name) || row.name === migration.newName)) continue;
       if (!availableMigrations.includes(migration.newName)) continue;
       const content = await readMigrationFileContent(migration.newName);
       fileHashes.set(migration.newName, createHash("sha256").update(content).digest("hex"));

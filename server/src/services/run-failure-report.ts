@@ -14,6 +14,7 @@ import { isUnexpectedRunCancellation } from "./run-cancellation.js";
 import { readConnectionFailure, type ConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { isAiConnectionConfigurationReason } from "./ai-connection-configuration-failure.js";
 import { readRunFailureReportingMode, type RunFailureReportingMode } from "../sentry-run-failure-policy.js";
+import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "./workspace-source-restriction.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 
@@ -120,6 +121,19 @@ function isLocalPathWorkspaceConfigurationBlocker(run: HeartbeatRun, options: Ru
     validation.workspaceStrategyType === "git_worktree" &&
     (validation.requestedExecutionWorkspaceMode === "isolated_workspace" ||
       validation.requestedExecutionWorkspaceMode === "operator_branch") &&
+    recovery?.kind === "bootstrap" && recovery.providerWorkStarted === false;
+}
+
+/** A retained shared checkout denied by task privacy before dispatch; the task notice names the owner action. */
+function isRestrictedWorkspaceSourceBlocker(run: HeartbeatRun, options: RunFailureReportOptions): boolean {
+  if (
+    run.status !== "failed" || run.errorCode !== "configuration_incomplete" ||
+    run.executionStage !== "preparing" || options.phase !== "setup" ||
+    run.exitCode != null || run.signal != null
+  ) return false;
+  const configuration = asRecord(run.resultJson?.configurationIncomplete);
+  const recovery = asRecord(run.resultJson?.executionRecovery);
+  return configuration?.reason === RESTRICTED_WORKSPACE_SOURCE_REASON &&
     recovery?.kind === "bootstrap" && recovery.providerWorkStarted === false;
 }
 
@@ -242,6 +256,7 @@ export function reportRunFailure(db: Db, run: HeartbeatRun, options: RunFailureR
     isMissingSecretConfigurationBlocker(run, options) ||
     isAiConnectionSelectionBlocker(run, options) ||
     isLocalPathWorkspaceConfigurationBlocker(run, options) ||
+    isRestrictedWorkspaceSourceBlocker(run, options) ||
     isGitConnectionFailure(run, options) ||
     isProviderQuotaFailure(run, options) ||
     isCodexAcpModelCapacityFailure(run, options) ||

@@ -1,23 +1,23 @@
 /** Exact identities retained when the two migration branches are merged. */
 export const RENAMED_FORK_MIGRATIONS = [
   {
-    previousName: "0320_onisall_intake_drafts.sql",
-    newName: "0347_onisall_intake_drafts.sql",
+    previousNames: ["0320_onisall_intake_drafts.sql", "0347_onisall_intake_drafts.sql"],
+    newName: "0355_onisall_intake_drafts.sql",
     sha256: "50f9ec8bcacecd2ace4595617046ad8ea8c053cb2c4db18dd63f77c3302ce4ec",
   },
   {
-    previousName: "0321_onisall_native_bindings.sql",
-    newName: "0348_onisall_native_bindings.sql",
+    previousNames: ["0321_onisall_native_bindings.sql", "0348_onisall_native_bindings.sql"],
+    newName: "0356_onisall_native_bindings.sql",
     sha256: "0a20074168c4d158b2d700fa02acd5ab01268ee4225d66aec97153a59a0b67a7",
   },
   {
-    previousName: "0322_onisall_preparation_baselines.sql",
-    newName: "0349_onisall_preparation_baselines.sql",
+    previousNames: ["0322_onisall_preparation_baselines.sql", "0349_onisall_preparation_baselines.sql"],
+    newName: "0357_onisall_preparation_baselines.sql",
     sha256: "8d63b7d695f479b7e4f779c78406c848bed63c564ecd3b57cf0197825a17b3b2",
   },
   {
-    previousName: "0323_onisall_schema_sets.sql",
-    newName: "0350_onisall_schema_sets.sql",
+    previousNames: ["0323_onisall_schema_sets.sql", "0350_onisall_schema_sets.sql"],
+    newName: "0358_onisall_schema_sets.sql",
     sha256: "d577349845aa0867715ad31949207278c914f2aa210bdc9e1fbff5d7b5a0739b",
   },
 ] as const;
@@ -51,7 +51,7 @@ export function normalizeRenamedMigrationHistory(
   for (const row of rows) {
     if (!row.name) continue;
     const migration = RENAMED_FORK_MIGRATIONS.find(
-      (entry) => entry.previousName === row.name || entry.newName === row.name,
+      (entry) => entry.previousNames.some((name) => name === row.name) || entry.newName === row.name,
     );
     if (!migration) {
       normalized.add(row.name);
@@ -61,7 +61,7 @@ export function normalizeRenamedMigrationHistory(
     const targets = options.availableMigrations.filter((name) => name === migration.newName);
     if (
       targets.length !== 1
-      || options.availableMigrations.includes(migration.previousName)
+      || migration.previousNames.some((name) => options.availableMigrations.includes(name))
       || options.fileHashes.get(migration.newName) !== migration.sha256
     ) {
       throw new Error(HISTORY_ERROR);

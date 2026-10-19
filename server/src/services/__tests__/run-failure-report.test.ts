@@ -738,6 +738,40 @@ describeEmbeddedPostgres("reportRunFailure", () => {
     expect(mockCaptureRunFailure).toHaveBeenCalledTimes(1);
   });
 
+  function restrictedWorkspaceSourceRun(overrides: Partial<typeof heartbeatRuns.$inferSelect> = {}) {
+    return buildRun({
+      errorCode: "configuration_incomplete",
+      executionStage: "preparing",
+      resultJson: {
+        configurationIncomplete: { reason: "workspace_source_restricted", issueId: randomUUID() },
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+      ...overrides,
+    });
+  }
+
+  it("keeps a restricted shared workspace source actionable on the task", async () => {
+    await seedCompanyAndAgent();
+    await reportRunFailure(db, restrictedWorkspaceSourceRun(), { phase: "setup" });
+    expect(mockCaptureRunFailure).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { status: "timed_out" }, { errorCode: "setup_failed" }, { executionStage: "executing" }, { exitCode: 1 }, { signal: "SIGTERM" },
+    { resultJson: { configurationIncomplete: { reason: "workspace_source_restricted" } } },
+    { resultJson: { configurationIncomplete: { reason: "workspace_source_restricted" }, executionRecovery: { kind: "bootstrap", providerWorkStarted: true } } },
+  ])("reports restricted-source markers without an exact pre-dispatch outcome: %j", async (overrides) => {
+    await seedCompanyAndAgent();
+    await reportRunFailure(db, restrictedWorkspaceSourceRun(overrides), { phase: "setup" });
+    expect(mockCaptureRunFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, "execute"] as const)("reports restricted-source markers outside the setup report: %s", async (phase) => {
+    await seedCompanyAndAgent();
+    await reportRunFailure(db, restrictedWorkspaceSourceRun(), { phase });
+    expect(mockCaptureRunFailure).toHaveBeenCalledTimes(1);
+  });
+
   function localPathConfigurationRun(overrides: Partial<typeof heartbeatRuns.$inferSelect> = {}) {
     return buildRun({
       errorCode: "workspace_validation_failed",
